@@ -23,6 +23,9 @@ English | [العربية](README.ar.md)
 
 ## 🚀 Quick Start
 
+🎥 **Watch Demo on YouTube:**  
+https://www.youtube.com/watch?v=9Y7C9A6L8EI
+
 ### Prerequisites
 - [BizHawk](https://github.com/TASEmulators/BizHawk/releases) 2.9+
 - Python 3.10+
@@ -95,7 +98,8 @@ See [API_README.md](API_README.md) for full reference.
 ├── README.md                    # This file
 ├── API_README.md                # Full API reference
 ├── MCP_SETUP.md                 # Detailed setup instructions
-└── LICENSE                      # MIT License
+└── lua/
+    └── socket.lua               # BizHawk emulator need it to lua script work.
 ```
 
 ## 📄 License
@@ -107,3 +111,4 @@ MIT License - see [LICENSE](LICENSE).
 Made with ❤️ by [AthbiStudio](https://sites.google.com/view/athbistudio/)
 
 For game reverse engineers and AI enthusiasts
+
