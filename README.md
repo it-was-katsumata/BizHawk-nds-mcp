@@ -20,6 +20,9 @@
 
 ## 🚀 Quick Start
 
+🎥 **Watch Demo on YouTube:**  
+https://www.youtube.com/watch?v=9Y7C9A6L8EI
+
 ### Prerequisites
 - [BizHawk](https://github.com/TASEmulators/BizHawk/releases) 2.9+
 - Python 3.10+
@@ -104,6 +107,7 @@ MIT License - see [LICENSE](LICENSE).
 Made with ❤️ by [AthbiStudio](https://sites.google.com/view/athbistudio/)
 
 For game reverse engineers and AI enthusiasts
+
 
 
 
