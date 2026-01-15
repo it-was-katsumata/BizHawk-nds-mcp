@@ -1,7 +1,7 @@
 # 🎮 BizHawk Debug Server
 
 **Python server for AI-powered NES game debugging with BizHawk emulator.**
-
+https://github.com/q8fft2/BizHawk-mcp/blob/main/demo/2026-01-15%2019-55-18.mp4
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 > ⚠️ **IMPORTANT**: All tools operate **ONLY on volatile emulator runtime state**. They do **NOT** modify files, server code, configuration, or the host system.
@@ -105,3 +105,4 @@ MIT License - see [LICENSE](LICENSE).
 Made with ❤️ by [AthbiStudio](https://sites.google.com/view/athbistudio/)
 
 For game reverse engineers and AI enthusiasts
+
