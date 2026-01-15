@@ -97,7 +97,7 @@ See [API_README.md](API_README.md) for full reference.
 ├── API_README.md                # Full API reference
 ├── MCP_SETUP.md                 # Detailed setup instructions
 └── lua/
-    └── socket.lua                # BizHawk emulator need it to lua script work.
+    └── socket.lua               # BizHawk emulator need it to lua script work.
 ```
 
 ## 📄 License
@@ -109,6 +109,7 @@ MIT License - see [LICENSE](LICENSE).
 Made with ❤️ by [AthbiStudio](https://sites.google.com/view/athbistudio/)
 
 For game reverse engineers and AI enthusiasts
+
 
 
 
