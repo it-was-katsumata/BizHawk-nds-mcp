@@ -41,6 +41,7 @@ https://www.youtube.com/watch?v=9Y7C9A6L8EI
    ```
 
 3. **Start BizHawk:**
+   - copy folder lua and paste to BizHawk root.
    - Open BizHawk and load a ROM
    - **Tools → Lua Console**
    - Load `src/bizhawk_debug_api.lua`
@@ -107,6 +108,7 @@ MIT License - see [LICENSE](LICENSE).
 Made with ❤️ by [AthbiStudio](https://sites.google.com/view/athbistudio/)
 
 For game reverse engineers and AI enthusiasts
+
 
 
 
