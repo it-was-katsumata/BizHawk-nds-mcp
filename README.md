@@ -1,7 +1,10 @@
+English | [العربية](README.ar.md)
+
 # 🎮 BizHawk Debug Server
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **Python server for AI-powered NES game debugging with BizHawk emulator.**
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 > ⚠️ **IMPORTANT**: All tools operate **ONLY on volatile emulator runtime state**. They do **NOT** modify files, server code, configuration, or the host system.
 
@@ -19,9 +22,6 @@
 | 🔒 **Freeze/Cheats** | Lock memory values (infinite lives, etc.) |
 
 ## 🚀 Quick Start
-
-🎥 **Watch Demo on YouTube:**  
-https://www.youtube.com/watch?v=9Y7C9A6L8EI
 
 ### Prerequisites
 - [BizHawk](https://github.com/TASEmulators/BizHawk/releases) 2.9+
@@ -41,7 +41,6 @@ https://www.youtube.com/watch?v=9Y7C9A6L8EI
    ```
 
 3. **Start BizHawk:**
-   - copy folder lua and paste to BizHawk root.
    - Open BizHawk and load a ROM
    - **Tools → Lua Console**
    - Load `src/bizhawk_debug_api.lua`
@@ -96,8 +95,7 @@ See [API_README.md](API_README.md) for full reference.
 ├── README.md                    # This file
 ├── API_README.md                # Full API reference
 ├── MCP_SETUP.md                 # Detailed setup instructions
-└── lua/
-    └── socket.lua               # BizHawk emulator need it to lua script work.
+└── LICENSE                      # MIT License
 ```
 
 ## 📄 License
@@ -109,13 +107,3 @@ MIT License - see [LICENSE](LICENSE).
 Made with ❤️ by [AthbiStudio](https://sites.google.com/view/athbistudio/)
 
 For game reverse engineers and AI enthusiasts
-
-
-
-
-
-
-
-
-
-

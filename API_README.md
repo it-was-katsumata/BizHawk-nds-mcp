@@ -1,3 +1,5 @@
+English | [العربية](API_README.ar.md)
+
 # BizHawk MCP Debug API Reference
 
 > ⚠️ **IMPORTANT**: All tools operate **ONLY on volatile emulator runtime state**. They do **NOT** modify files, server code, configuration, or the host system.

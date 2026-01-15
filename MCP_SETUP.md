@@ -1,3 +1,5 @@
+English | [العربية](MCP_SETUP.ar.md)
+
 # BizHawk Debug Server Setup
 
 > ⚠️ **IMPORTANT**: All tools operate **ONLY on volatile emulator runtime state**. They do **NOT** modify files, server code, configuration, or the host system.
