@@ -1,27 +1,45 @@
 --[[
-  BizHawk/EmuHawk Debug API for AI
-  Comprehensive debugging interface for AI agents
-  
-  Based on mesen_debug_api.lua, adapted for BizHawk's Lua API
-  
-  Key Differences from Mesen:
-  - BizHawk uses memory domains (memory.usememorydomain)
-  - Uses event.onmemoryread/write instead of addMemoryCallback
-  - Frame advance with emu.frameadvance() or while loop
-  - No execution time limits - FULL AI CONTROL!
-  - Uses client.pause() and client.unpause() for execution control
-  
-  Features:
-  - Memory read/write/search
-  - CPU state access
+  BizHawk/EmuHawk Debug API for AI — NDS adaptation
+  Comprehensive debugging interface for AI agents.
+
+  Originally written for NES; this fork adapts it for Nintendo DS via
+  the MelonDS core in BizHawk 2.10+.  See translate-r00 project notes
+  in C:\ds_translation_patch for context (ROM hacking workflow).
+
+  Memory domains exposed by MelonDS in BizHawk (verified via
+  memory.getmemorydomainlist()):
+    System Bus / ARM9 System Bus / ARM7 System Bus
+    Main RAM         (0x02000000, 4 MB)
+    Main RAM (ARM7)  (0x02000000 mirror for ARM7)
+    Shared WRAM, ARM7 WRAM, ARM9 ITCM, ARM9 DTCM
+    Main Palette, Sub Palette, OAM, ARM9 BIOS, ARM7 BIOS
+    VRAM (often presented as a flat block 0x06000000 onward)
+  Use System Bus to address by physical DS address (0x02000000 main
+  RAM, 0x04000000 I/O, 0x05000000 palette, 0x06xxxxxx VRAM,
+  0x07000000 OAM).
+
+  NDS-specific actions added by this adaptation (callable via the
+  Python MCP server's emu_debug_raw_command tool):
+    screenshot.take {path=...}
+    input.touch     {x=..., y=..., frames=N}
+    input.touch_release {}
+    frame.advance   {frames=N}
+    oam.parse       {engine="main"|"sub"}
+    dispcnt.decode  {engine="main"|"sub"}
+    powcnt.read     {}
+    vramcnt.decode  {}
+    bg.read         {engine="main"|"sub", index=0..3}
+
+  Features (inherited from upstream):
+  - Memory read/write/search/snapshot/compare
+  - CPU state access (ARM9 / ARM7 registers exposed by MelonDS)
   - Execution control (pause, step, resume) - FULLY WORKING
   - Memory breakpoints with callbacks
-  - Disassembly (6502)
   - Trace logging
   - Watch list
-  
+
   Usage:
-  1. Open BizHawk and load a ROM
+  1. Open BizHawk 2.10+ and load an NDS ROM
   2. Tools > Lua Console
   3. Load this script (Open Script or drag & drop)
   4. Script runs continuously with full control
@@ -48,8 +66,26 @@ local COMMAND_FILE = BASE_PATH .. "debug_commands.json"
 local RESPONSE_FILE = BASE_PATH .. "debug_response.json"
 local TRACE_FILE = BASE_PATH .. "debug_trace.json"
 
-local RAM_SIZE = 0x800  -- 2KB NES RAM
-local PRG_SIZE = 0x8000 -- 32KB PRG ROM (typical)
+-- NDS main RAM is 4 MB (0x02000000..0x023FFFFF).  Memory.search and
+-- Memory.snapshot iterate this on the "Main RAM" domain; cap defaults
+-- to a smaller range when called interactively so a full sweep doesn't
+-- freeze the emulator for many seconds.
+local RAM_SIZE = 0x400000          -- 4 MB Main RAM (full)
+local RAM_SEARCH_DEFAULT = 0x40000 -- 256 KB default sweep
+-- ARM9 System Bus is the unified domain; Main RAM lives at 0x02000000.
+-- Use opts.start = 0x02000000 in Memory.search/snapshot to sweep it.
+local DEFAULT_RAM_DOMAIN = "ARM9 System Bus"
+local MAIN_RAM_BASE = 0x02000000
+
+-- BizHawk's MelonDS core (verified 2.11.1) exposes these NDS domains:
+--   Shared WRAM, ARM7 WRAM, SRAM, ROM, Instruction TCM, Data TCM,
+--   ARM9 BIOS, ARM7 BIOS, Firmware,
+--   ARM9 System Bus, ARM7 System Bus, Waterbox PageData
+-- No separate Main RAM / VRAM / OAM domains — everything is reached
+-- through ARM9 System Bus (which gives the ARM9's full memory map:
+-- 0x02000000 main RAM, 0x04000000 I/O, 0x05000000 palette,
+-- 0x06xxxxxx VRAM, 0x07000000 OAM).
+local DEFAULT_SYSTEM_DOMAIN = "ARM9 System Bus"
 
 -- ═══════════════════════════════════════════════════════════════
 -- SOCKET CONFIGURATION (LuaSocket - Fast Communication)
@@ -68,10 +104,14 @@ local socketOk, socketErr = pcall(function()
 end)
 
 if socketOk and socket then
-    console.log("[SOCKET] LuaSocket loaded successfully!")
+    console.log("[SOCKET] LuaSocket loaded successfully — using TCP")
 else
-    console.log("[SOCKET] LuaSocket not available: " .. tostring(socketErr))
-    console.log("[SOCKET] Falling back to file-based communication")
+    -- File-IPC fallback is the supported path for this NDS fork.  The
+    -- upstream q8fft2 repo ships a lua/socket.lua but BizHawk's Lua
+    -- engine doesn't pick it up reliably across versions, and file IPC
+    -- works fine for our use case (sub-second latency, no port to
+    -- configure).  Silencing the long error trace to reduce noise.
+    console.log("[SOCKET] LuaSocket not available — using file IPC (fine, no action needed)")
     SOCKET_ENABLED = false
 end
 
@@ -269,11 +309,11 @@ end
 
 local Memory = {}
 
--- Set memory domain for NES
+-- Set memory domain (default = ARM9 System Bus for NDS)
 local function setMemoryDomain(domain)
     -- Handle nil, empty string, or "null" (from JSON)
     if domain == nil or domain == "" or domain == "null" then
-        domain = "System Bus"
+        domain = DEFAULT_SYSTEM_DOMAIN
     end
     local ok = pcall(function()
         memory.usememorydomain(domain)
@@ -281,8 +321,8 @@ local function setMemoryDomain(domain)
     return ok
 end
 
--- Initialize with System Bus domain
-setMemoryDomain("System Bus")
+-- Initialize with the NDS unified address domain
+setMemoryDomain(DEFAULT_SYSTEM_DOMAIN)
 
 function Memory.read(addr, domain)
     addr = parseAddress(addr)
@@ -353,10 +393,14 @@ function Memory.readRange(startAddr, length, domain)
     return data
 end
 
-function Memory.search(value)
+function Memory.search(value, opts)
+    opts = opts or {}
+    local domain = opts.domain or DEFAULT_RAM_DOMAIN
+    local startAddr = opts.start or 0
+    local endAddr = opts.endAddr or (startAddr + RAM_SEARCH_DEFAULT)
     local results = {}
-    setMemoryDomain("RAM")  -- Search in RAM
-    for addr = 0, RAM_SIZE - 1 do
+    setMemoryDomain(domain)
+    for addr = startAddr, endAddr - 1 do
         if memory.readbyte(addr) == value then
             table.insert(results, {
                 address = addr,
@@ -365,14 +409,18 @@ function Memory.search(value)
             })
         end
     end
-    setMemoryDomain("System Bus")  -- Reset to System Bus
+    setMemoryDomain(DEFAULT_SYSTEM_DOMAIN)
     return results
 end
 
-function Memory.searchRange(minVal, maxVal)
+function Memory.searchRange(minVal, maxVal, opts)
+    opts = opts or {}
+    local domain = opts.domain or DEFAULT_RAM_DOMAIN
+    local startAddr = opts.start or 0
+    local endAddr = opts.endAddr or (startAddr + RAM_SEARCH_DEFAULT)
     local results = {}
-    setMemoryDomain("RAM")
-    for addr = 0, RAM_SIZE - 1 do
+    setMemoryDomain(domain)
+    for addr = startAddr, endAddr - 1 do
         local val = memory.readbyte(addr)
         if val >= minVal and val <= maxVal then
             table.insert(results, {
@@ -382,43 +430,47 @@ function Memory.searchRange(minVal, maxVal)
             })
         end
     end
-    setMemoryDomain("System Bus")
+    setMemoryDomain(DEFAULT_SYSTEM_DOMAIN)
     return results
 end
 
-function Memory.snapshot(name)
+function Memory.snapshot(name, opts)
     name = name or "default"
+    opts = opts or {}
+    local domain = opts.domain or DEFAULT_RAM_DOMAIN
+    local startAddr = opts.start or 0
+    local endAddr = opts.endAddr or (startAddr + RAM_SEARCH_DEFAULT)
     local data = {}
-    setMemoryDomain("RAM")
-    for addr = 0, RAM_SIZE - 1 do
+    setMemoryDomain(domain)
+    for addr = startAddr, endAddr - 1 do
         data[addr] = memory.readbyte(addr)
     end
-    setMemoryDomain("System Bus")
-    snapshots[name] = data
-    return { name = name, size = RAM_SIZE }
+    setMemoryDomain(DEFAULT_SYSTEM_DOMAIN)
+    snapshots[name] = { data = data, start = startAddr, endAddr = endAddr, domain = domain }
+    return { name = name, size = endAddr - startAddr, domain = domain }
 end
 
 function Memory.compare(name, filter)
     name = name or "default"
     filter = filter or "changed"
-    
+
     local snapshot = snapshots[name]
     if not snapshot then return { error = "Snapshot not found" } end
-    
+
     local changes = {}
-    setMemoryDomain("RAM")
-    for addr = 0, RAM_SIZE - 1 do
+    setMemoryDomain(snapshot.domain or DEFAULT_RAM_DOMAIN)
+    for addr = snapshot.start, snapshot.endAddr - 1 do
         local current = memory.readbyte(addr)
-        local old = snapshot[addr]
+        local old = snapshot.data[addr]
         local diff = current - old
-        
+
         local include = false
         if filter == "changed" then include = (diff ~= 0)
         elseif filter == "increased" then include = (diff > 0)
         elseif filter == "decreased" then include = (diff < 0)
         elseif filter == "same" then include = (diff == 0)
         end
-        
+
         if include then
             table.insert(changes, {
                 address = addr,
@@ -429,7 +481,7 @@ function Memory.compare(name, filter)
             })
         end
     end
-    setMemoryDomain("System Bus")
+    setMemoryDomain(DEFAULT_SYSTEM_DOMAIN)
     return changes
 end
 
@@ -639,11 +691,11 @@ function Breakpoints.add(bpType, addr, options)
     -- Register the appropriate event
     local eventGuid = nil
     if bpType == "read" then
-        eventGuid = event.onmemoryread(callback, addr, "System Bus")
+        eventGuid = event.onmemoryread(callback, addr, DEFAULT_SYSTEM_DOMAIN)
     elseif bpType == "write" then
-        eventGuid = event.onmemorywrite(callback, addr, "System Bus")
+        eventGuid = event.onmemorywrite(callback, addr, DEFAULT_SYSTEM_DOMAIN)
     elseif bpType == "execute" then
-        eventGuid = event.onmemoryexecute(callback, addr, "System Bus")
+        eventGuid = event.onmemoryexecute(callback, addr, DEFAULT_SYSTEM_DOMAIN)
     else
         return { error = "Invalid breakpoint type: " .. tostring(bpType) }
     end
@@ -952,9 +1004,9 @@ local Freeze = {}
 function Freeze.add(addr, value, label, domain)
     addr = parseAddress(addr)
     
-    -- Normalize domain (nil, empty, or "null" becomes "System Bus")
+    -- Normalize domain (nil, empty, or "null" becomes default = ARM9 System Bus on NDS)
     if domain == nil or domain == "" or domain == "null" then
-        domain = "System Bus"
+        domain = DEFAULT_SYSTEM_DOMAIN
     end
     
     -- Check freeze limit
@@ -1190,7 +1242,7 @@ local function processCommand(cmd)
         local buttons = cmd.buttons
         local player = cmd.player or 1
         local joypad_input = {}
-        
+
         -- Validate buttons is a table
         if buttons == nil then
             buttons = {}
@@ -1198,16 +1250,398 @@ local function processCommand(cmd)
             response.data = { error = "buttons must be a table/object, got: " .. type(buttons) }
             return response
         end
-        
-        -- Map button names to BizHawk format
-        for btn, pressed in pairs(buttons) do
-            if pressed then
+
+        -- BizHawk NDS reports touch keys as "Touch", "Touch X", "Touch Y"
+        -- (with literal spaces) — not "TouchX"/"TouchY". Touch is a
+        -- digital boolean (joypad.set). Touch X / Touch Y are NUMERIC
+        -- and only respond to joypad.setanalog. Wrong API or wrong name
+        -- gets silently dropped, which caused the long-standing
+        -- "Touch=true fires but coords ignored" symptom.
+        local analog_input = {}
+        for btn, val in pairs(buttons) do
+            if btn == "Touch" then
+                joypad_input["Touch"] = val
+            elseif btn == "TouchX" or btn == "Touch X" then
+                analog_input["Touch X"] = val
+            elseif btn == "TouchY" or btn == "Touch Y" then
+                analog_input["Touch Y"] = val
+            elseif val == true then
                 joypad_input["P" .. player .. " " .. btn] = true
+            elseif type(val) == "number" then
+                analog_input["P" .. player .. " " .. btn] = val
             end
         end
-        
+
         joypad.set(joypad_input)
+        if next(analog_input) ~= nil then
+            joypad.setanalog(analog_input)
+        end
         response.data = { input = true, buttons = buttons }
+
+    -- ───────────────────────────── NDS-specific actions ─────────────────────────────
+    elseif action == "input.touch" then
+        -- Touch the bottom screen at (x, y) for `frames` frames, then release.
+        -- KEY FACTS verified via input.debug on MelonDS NDS core:
+        --   - Touch keys live in joypad.get() (no player arg), not get(1).
+        --   - "Touch" is a digital boolean — settable via joypad.set.
+        --   - "Touch X" / "Touch Y" (with spaces) are NUMERIC controls
+        --     settable via joypad.setanalog. joypad.set ignores numeric
+        --     values for them, leaving the coords stuck at the last
+        --     value (often 255/0 — top-right corner) so the tap fires
+        --     wherever was last set.
+        --   - Pass no player arg (or omit explicitly) so it matches the
+        --     player-nil schema where the NDS controls live.
+        local x = cmd.x or 0
+        local y = cmd.y or 0
+        local frames = cmd.frames or 8
+        isPausedState = false
+        currentState = STATE_RUNNING
+        -- joypad.set with full-state override: get the current input
+        -- table, modify Touch / Touch X / Touch Y, then call joypad.set
+        -- with the FULL table. This bypasses the XorAdapter that breaks
+        -- joypad.setanalog whenever a mouse binding still exists on the
+        -- touch axes (BizHawk XORs sticky autoholds against regular
+        -- inputs, forcing the axis to neutral if both are non-neutral).
+        -- joypad.set is a per-frame OVERRIDE, not a sticky autohold, so
+        -- the XOR doesn't apply.
+        local post_x, post_y, post_touch
+        for _ = 1, frames do
+            if client.unpause then client.unpause() end
+            local ds = joypad.get() or {}
+            ds["Touch"] = true
+            ds["Touch X"] = x
+            ds["Touch Y"] = y
+            joypad.set(ds)
+            -- Also push through setanalog explicitly — some BizHawk
+            -- builds only honor numeric touch values via this API even
+            -- when joypad.set has them in the table.
+            joypad.setanalog({ ["Touch X"] = x, ["Touch Y"] = y })
+            local check = joypad.get() or {}
+            post_x = check["Touch X"]
+            post_y = check["Touch Y"]
+            post_touch = check["Touch"]
+            emu.frameadvance()
+        end
+        if client.unpause then client.unpause() end
+        local ds = joypad.get() or {}
+        ds["Touch"] = false
+        joypad.set(ds)
+        emu.frameadvance()
+        response.data = {
+            touched = true, x = x, y = y, frames = frames,
+            post_x = post_x, post_y = post_y, post_touch = post_touch,
+        }
+
+    elseif action == "input.touch_release" then
+        local ds = joypad.get() or {}
+        ds["Touch"] = false
+        joypad.set(ds)
+        response.data = { released = true }
+
+    elseif action == "input.debug" then
+        -- Dump joypad immutable + mutable state so we can see the actual
+        -- button/analog names BizHawk exposes for the current core.
+        local digital_p1 = joypad.get(1) or {}
+        local digital_nil = joypad.get() or {}
+        local analog_p1 = joypad.getimmediate(1) or {}
+        -- Build sortable string lists from these maps.
+        local function keyset(t)
+            local keys = {}
+            for k, v in pairs(t) do
+                table.insert(keys, tostring(k) .. "=" .. tostring(v))
+            end
+            table.sort(keys)
+            return keys
+        end
+        response.data = {
+            digital_p1 = keyset(digital_p1),
+            digital_nil = keyset(digital_nil),
+            analog_p1 = keyset(analog_p1),
+            note = "if any TouchX/TouchY-related key appears, that is the canonical name to use",
+        }
+
+    elseif action == "input.press" then
+        -- Press a single button for N frames then release. Avoids the
+        -- nested-object JSON parsing limitation of input.set.
+        -- Params: button (string, e.g. "A", "B", "Down"), frames (int, default 8)
+        -- Sets BOTH "P1 BTN" and "BTN" key formats since NDS uses no
+        -- prefix while other systems use P1.
+        local btn = cmd.button or "A"
+        local frames = cmd.frames or 8
+        local player = cmd.player or 1
+        local key1 = "P" .. player .. " " .. btn
+        local key2 = btn
+        isPausedState = false
+        currentState = STATE_RUNNING
+        for _ = 1, frames do
+            -- Unpause EVERY frame. See input.touch comment for why —
+            -- mid-loop pauses cause the button to be held while BizHawk
+            -- catches up on unpause, producing stuck-input symptoms.
+            if client.unpause then client.unpause() end
+            joypad.set({ [key1] = true, [key2] = true })
+            emu.frameadvance()
+        end
+        if client.unpause then client.unpause() end
+        joypad.set({ [key1] = false, [key2] = false })
+        emu.frameadvance()
+        response.data = { pressed = btn, frames = frames }
+
+    elseif action == "system.reset" then
+        -- Hard reset / power cycle the emulator core.
+        -- client.reboot_core() can leave the emulator paused; explicitly
+        -- unpause and sync our isPausedState so the main loop resumes
+        -- frame advancing.  Without this, the script's main loop would
+        -- yield indefinitely (the cause of the "stale bridge" symptom).
+        client.reboot_core()
+        if client.unpause then client.unpause() end
+        isPausedState = false
+        currentState = STATE_RUNNING
+        -- Explicitly release every known NDS button. joypad.set({}) is
+        -- a NO-OP in BizHawk, so we have to list every button to clear
+        -- any leftover Lua-side input state from prior commands.
+        joypad.set({
+            ["P1 A"] = false, ["P1 B"] = false,
+            ["P1 X"] = false, ["P1 Y"] = false,
+            ["P1 L"] = false, ["P1 R"] = false,
+            ["P1 Up"] = false, ["P1 Down"] = false,
+            ["P1 Left"] = false, ["P1 Right"] = false,
+            ["P1 Start"] = false, ["P1 Select"] = false,
+            ["A"] = false, ["B"] = false,
+            ["X"] = false, ["Y"] = false,
+            ["L"] = false, ["R"] = false,
+            ["Up"] = false, ["Down"] = false,
+            ["Left"] = false, ["Right"] = false,
+            ["Start"] = false, ["Select"] = false,
+            ["Touch"] = false,
+        })
+        -- Clear analog Touch X/Y too (different API).
+        joypad.setanalog({ ["Touch X"] = "", ["Touch Y"] = "" })
+        emu.frameadvance()
+        response.data = { reset = true }
+
+    elseif action == "system.close_rom" then
+        -- Close the currently loaded ROM. After this, no ROM is loaded;
+        -- emulator state is whatever BizHawk shows when no ROM is open.
+        -- Useful before swapping ROM files (so the file handle isn't
+        -- held by BizHawk and the patcher can overwrite it).
+        local ok, err = pcall(client.closerom)
+        if ok then
+            isPausedState = false
+            currentState = STATE_RUNNING
+            response.data = { closed = true }
+        else
+            response.success = false
+            response.data = { error = tostring(err) }
+        end
+
+    elseif action == "system.open_rom" then
+        -- Load a ROM file. `path` is the absolute path to the ROM.
+        -- After loading, BizHawk may pause briefly; we unpause and
+        -- clear joypad state so navigation works immediately.
+        local rompath = cmd.path
+        if not rompath then
+            response.success = false
+            response.data = { error = "missing 'path' param" }
+        else
+            local ok, err = pcall(function() client.openrom(rompath) end)
+            if ok then
+                if client.unpause then client.unpause() end
+                isPausedState = false
+                currentState = STATE_RUNNING
+                joypad.set({
+                    ["P1 A"] = false, ["P1 B"] = false,
+                    ["P1 X"] = false, ["P1 Y"] = false,
+                    ["P1 L"] = false, ["P1 R"] = false,
+                    ["P1 Up"] = false, ["P1 Down"] = false,
+                    ["P1 Left"] = false, ["P1 Right"] = false,
+                    ["P1 Start"] = false, ["P1 Select"] = false,
+                    ["A"] = false, ["B"] = false,
+                    ["X"] = false, ["Y"] = false,
+                    ["L"] = false, ["R"] = false,
+                    ["Up"] = false, ["Down"] = false,
+                    ["Left"] = false, ["Right"] = false,
+                    ["Start"] = false, ["Select"] = false,
+                    ["Touch"] = false,
+                })
+                emu.frameadvance()
+                response.data = { opened = true, path = rompath }
+            else
+                response.success = false
+                response.data = { error = tostring(err) }
+            end
+        end
+
+    elseif action == "frame.advance" then
+        local n = cmd.frames or 1
+        for _ = 1, n do
+            emu.frameadvance()
+        end
+        response.data = { advanced = n, frameCount = emu.framecount() }
+
+    elseif action == "memory.dump_to_file" then
+        -- Read `length` bytes from `address` in `domain` and write the raw
+        -- bytes to `path`.  Avoids transferring large memory regions through
+        -- the JSON/MCP layer.
+        local addr = parseAddress(cmd.address or 0)
+        local length = cmd.length or 0
+        local path = cmd.path
+        local domain = cmd.domain or DEFAULT_SYSTEM_DOMAIN
+        if not path or length <= 0 then
+            response.data = { error = "memory.dump_to_file requires {address, length, path}" }
+            return response
+        end
+        local prev = memory.getcurrentmemorydomain()
+        setMemoryDomain(domain)
+        local f = io.open(path, "wb")
+        if not f then
+            setMemoryDomain(prev)
+            response.data = { error = "cannot open " .. tostring(path) }
+            return response
+        end
+        for i = 0, length - 1 do
+            f:write(string.char(memory.readbyte(addr + i)))
+        end
+        f:close()
+        setMemoryDomain(prev)
+        response.data = { saved = true, path = path, bytes = length,
+                          address = string.format("0x%08X", addr) }
+
+    elseif action == "screenshot.take" then
+        local path = cmd.path
+        if not path or path == "" then
+            response.data = { error = "screenshot.take requires `path`" }
+            return response
+        end
+        local ok, err = pcall(function() client.screenshot(path) end)
+        response.data = ok and { saved = true, path = path }
+                            or  { error = "screenshot failed: " .. tostring(err) }
+
+    elseif action == "powcnt.read" then
+        local prev = memory.getcurrentmemorydomain()
+        setMemoryDomain(DEFAULT_SYSTEM_DOMAIN)
+        local v = memory.read_u16_le(0x04000304)
+        setMemoryDomain(prev)
+        local swap = (v >= 0x8000)
+        response.data = {
+            powcnt1 = v,
+            hex = string.format("0x%04X", v),
+            lcd_swap = swap,
+            engine_a_screen = swap and "bottom" or "top",
+            engine_b_screen = swap and "top" or "bottom",
+            engine_a_enabled = (v % 4) >= 2,
+        }
+
+    elseif action == "dispcnt.decode" then
+        local prev = memory.getcurrentmemorydomain()
+        setMemoryDomain(DEFAULT_SYSTEM_DOMAIN)
+        local engine = cmd.engine or "main"
+        local base = (engine == "sub") and 0x04001000 or 0x04000000
+        local dc = memory.read_u32_le(base)
+        setMemoryDomain(prev)
+        local bg_on = {}
+        for i = 0, 3 do
+            bg_on[i] = (math.floor(dc / 2^(8 + i)) % 2) == 1
+        end
+        response.data = {
+            engine = engine,
+            dispcnt = dc,
+            hex = string.format("0x%08X", dc),
+            mode = dc % 8,
+            obj_1d_mapping = ((math.floor(dc / 16) % 2) == 1),
+            obj_boundary = (math.floor(dc / 2^20) % 8),
+            obj_enabled = ((math.floor(dc / 4096) % 2) == 1),
+            bg0_enabled = bg_on[0], bg1_enabled = bg_on[1],
+            bg2_enabled = bg_on[2], bg3_enabled = bg_on[3],
+            display_mode = (math.floor(dc / 2^16) % 4),
+        }
+
+    elseif action == "vramcnt.decode" then
+        local prev = memory.getcurrentmemorydomain()
+        setMemoryDomain(DEFAULT_SYSTEM_DOMAIN)
+        local banks = {}
+        for i = 0, 8 do
+            local v = memory.readbyte(0x04000240 + i)
+            banks[string.char(65 + i)] = {
+                value = v, hex = string.format("0x%02X", v),
+                enable = (v >= 0x80),
+                mst = (v % 8),
+                offset = (math.floor(v / 8) % 4),
+            }
+        end
+        setMemoryDomain(prev)
+        response.data = banks
+
+    elseif action == "bg.read" then
+        -- Read one BG layer's CNT register + 24x32 tilemap entries.
+        local engine = cmd.engine or "main"
+        local idx = cmd.index or 0
+        local cnt_base = (engine == "sub") and 0x04001008 or 0x04000008
+        local vram_base = (engine == "sub") and 0x06200000 or 0x06000000
+        local prev = memory.getcurrentmemorydomain()
+        setMemoryDomain(DEFAULT_SYSTEM_DOMAIN)
+        local cnt = memory.read_u16_le(cnt_base + idx * 2)
+        local screen_base = math.floor(cnt / 256) % 32
+        local char_base = math.floor(cnt / 4) % 16
+        local map_addr = vram_base + screen_base * 0x800
+        local tile_addr = vram_base + char_base * 0x4000
+        local rows = {}
+        for r = 0, 23 do
+            local row = {}
+            for c = 0, 31 do
+                row[c + 1] = memory.read_u16_le(map_addr + (r * 32 + c) * 2)
+            end
+            rows[r + 1] = row
+        end
+        setMemoryDomain(prev)
+        response.data = {
+            engine = engine, index = idx,
+            cnt = cnt, hex = string.format("0x%04X", cnt),
+            priority = (cnt % 4),
+            colors_256 = ((math.floor(cnt / 128) % 2) == 1),
+            char_base = char_base,
+            screen_base = screen_base,
+            map_addr = string.format("0x%08X", map_addr),
+            tile_addr = string.format("0x%08X", tile_addr),
+            tilemap = rows,
+        }
+
+    elseif action == "oam.parse" then
+        -- Decode visible sprites from MAIN or SUB OAM into a list.
+        local engine = cmd.engine or "main"
+        local base = (engine == "sub") and 0x07000400 or 0x07000000
+        local SIZE = {
+            [0] = { [0]={1,1},[1]={2,2},[2]={4,4},[3]={8,8} },
+            [1] = { [0]={2,1},[1]={4,1},[2]={4,2},[3]={8,4} },
+            [2] = { [0]={1,2},[1]={1,4},[2]={2,4},[3]={4,8} },
+        }
+        local prev = memory.getcurrentmemorydomain()
+        setMemoryDomain(DEFAULT_SYSTEM_DOMAIN)
+        local sprites = {}
+        for i = 0, 127 do
+            local a0 = memory.read_u16_le(base + i * 8)
+            local a1 = memory.read_u16_le(base + i * 8 + 2)
+            local a2 = memory.read_u16_le(base + i * 8 + 4)
+            local y = a0 % 256
+            local rot = (math.floor(a0 / 256) % 2) == 1
+            local dis = (math.floor(a0 / 512) % 2) == 1
+            local shape = math.floor(a0 / 16384) % 4
+            local x = a1 % 512
+            local size = math.floor(a1 / 16384) % 4
+            local tile = a2 % 1024
+            local pri = math.floor(a2 / 1024) % 4
+            local pal = math.floor(a2 / 4096) % 16
+            if (not (not rot and dis)) and SIZE[shape] and SIZE[shape][size] then
+                local wh = SIZE[shape][size]
+                table.insert(sprites, {
+                    idx = i, y = y, x = x, tile = tile,
+                    w_tiles = wh[1], h_tiles = wh[2],
+                    priority = pri, palette = pal,
+                    rotated = rot,
+                })
+            end
+        end
+        setMemoryDomain(prev)
+        response.data = { engine = engine, sprites = sprites }
         
     -- Legacy commands
     elseif action == "search" then
@@ -1267,7 +1701,7 @@ end
 -- Check for socket commands using LuaSocket (fast path)
 local function checkSocketCommands()
     if not SOCKET_ENABLED or not socketInitialized then return false end
-    
+
     -- Accept new connection if no current client
     if not socketClient then
         local client, err = socketServer:accept()
@@ -1278,7 +1712,7 @@ local function checkSocketCommands()
         end
         return false
     end
-    
+
     -- Try to receive data from client
     local data, err = socketClient:receive("*l")  -- Read line
     if data then
@@ -1286,8 +1720,14 @@ local function checkSocketCommands()
         if cmd and cmd.id then
             lastCommandId = cmd.id
             log("[SOCKET] Command: " .. tostring(cmd.action) .. " (id=" .. tostring(cmd.id) .. ")")
-            
-            local response = processCommand(cmd)
+
+            -- pcall so a single command's runtime error doesn't kill the
+            -- bridge (and the main loop) and leave BizHawk stale.
+            local ok, response = pcall(processCommand, cmd)
+            if not ok then
+                console.log("[SOCKET] Command error: " .. tostring(response))
+                response = { success = false, error = tostring(response) }
+            end
             response.commandId = cmd.id
             
             -- Send response back via socket
@@ -1312,16 +1752,21 @@ end
 local function checkFileCommands()
     local content = readFile(COMMAND_FILE)
     if not content or content == "" then return end
-    
+
     local cmd = parseJson(content)
     if not cmd or not cmd.id or cmd.id <= lastCommandId then return end
-    
+
     lastCommandId = cmd.id
     log("[FILE] Processing command: " .. tostring(cmd.action) .. " (id=" .. tostring(cmd.id) .. ")")
-    
-    local response = processCommand(cmd)
+
+    -- pcall so a single command's runtime error doesn't kill the bridge.
+    local ok, response = pcall(processCommand, cmd)
+    if not ok then
+        console.log("[FILE] Command error: " .. tostring(response))
+        response = { success = false, error = tostring(response) }
+    end
     response.commandId = cmd.id
-    
+
     writeFile(RESPONSE_FILE, toJson(response))
     log("[FILE] Response written for command " .. tostring(cmd.id))
 end
@@ -1408,13 +1853,18 @@ while true do
     
     -- Frame advance - but handle paused state to keep processing commands
     -- CRITICAL FIX: emu.frameadvance() BLOCKS when paused, preventing command processing
-    -- Use emu.yield() when paused to return control without advancing frames
-    if isPausedState then
-        -- When paused, yield without advancing frames
-        -- This allows checkCommands() to run on next iteration
+    -- We must check BizHawk's ACTUAL pause state (not just our flag) — if the
+    -- user pressed Pause in BizHawk's UI, emu.frameadvance() would hang
+    -- here, the main loop would freeze, and MCP would see "stale bridge".
+    -- yield() keeps the script alive without trying to advance frames.
+    local bizhawkPaused = false
+    if client.ispaused then
+        local ok, p = pcall(client.ispaused)
+        if ok then bizhawkPaused = p end
+    end
+    if isPausedState or bizhawkPaused then
         emu.yield()
     else
-        -- Normal operation: advance one frame
         emu.frameadvance()
     end
 end

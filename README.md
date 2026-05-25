@@ -1,8 +1,14 @@
 English | [العربية](README.ar.md)
 
-# 🎮 BizHawk Debug Server
+# 🎮 BizHawk Debug Server — NDS fork
 
-**Python server for AI-powered NES game debugging with BizHawk emulator.**
+**Python MCP server + Lua bridge for AI-driven Nintendo DS work in BizHawk (MelonDS core).**
+
+Forked from [q8fft2/BizHawk-mcp](https://github.com/q8fft2/BizHawk-mcp)
+(NES-only, MIT licensed). This fork adapts the Lua bridge for NDS
+memory domains, adds touchscreen input, screenshot capture, and helper
+actions for parsing OAM, DISPCNT, POWCNT, VRAMCNT, and BG tilemaps.
+Used for the [NTR-YNAJA-JPN English translation patch](../ds_translation_patch).
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 

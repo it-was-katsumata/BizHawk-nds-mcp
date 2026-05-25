@@ -1,0 +1,17 @@
+# BizHawk debug IPC state (runtime, regenerated each session)
+src/debug_commands.json
+src/debug_response.json
+src/debug_state.json
+src/bizhawk_mcp.log
+
+# Screenshots / scratch outputs from MCP sessions
+dumps/
+*.png
+*.bin
+
+# Local helper scripts not part of the bridge itself
+render_tiles.py
+
+# Python cache
+__pycache__/
+*.pyc
