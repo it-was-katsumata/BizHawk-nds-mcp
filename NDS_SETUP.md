@@ -121,6 +121,7 @@ emu_debug_raw_command(action="screenshot.take", params={"path": "C:/tmp/shot.png
 | `input.touch` | `x, y, frames=8` | touches at (x, y) for N frames + releases. **Requires the mouse-rebind workaround documented in Troubleshooting** — without it, mouse XOR forces the tap to land at cursor position regardless of (x, y). |
 | `input.touch_release` | — | releases Touch and clears the analog autoholds |
 | `input.press` | `button="A", frames=8` | press one button for N frames then release. Avoids the nested-object JSON quirk in `input.set`. |
+| `input.sequence` | `seq="press A; sleep 6; press A; sleep 2.5; press A; sleep 8; press Right; sleep 0.4; press Down; sleep 0.4; press A; sleep 1"` | runs several input steps in ONE command (one round trip for a whole navigation sequence instead of one per button). `seq` is a flat string: steps split by `;`, fields by spaces. Step forms: `press <BTN> [frames]`, `touch <x> <y> [frames]`, `wait <frames>` (emulated frames, default 8), `sleep <seconds>` (wall-clock real time, advances frames meanwhile). Use `sleep` between screen transitions so the next input lands after the game has settled. Prefer `press A`/`press B` over `touch` for "touch to continue" / menu screens — a `touch` lands at fixed coords and can hit the wrong button. The socket and file timeouts are 30s (see `SOCKET_TIMEOUT` / `DEFAULT_TIMEOUT`), so a full ~20s boot-to-screen batch fits in one command. The example above is the verified NANA boot→Fashion navigation. |
 | `input.debug` | — | returns the full `joypad.get()` / `joypad.get(1)` / `joypad.getimmediate(1)` maps so you can discover which key names the current core exposes. Critical for NDS where touch keys are `Touch X` / `Touch Y` with a literal space, not `TouchX` / `TouchY`. |
 | `frame.advance` | `frames=1` | advances N frames |
 | `screenshot.take` | `path` | saves screen to PNG file |
@@ -147,6 +148,15 @@ ROM — so the bridge stays alive across `system.close_rom` and resumes on
 `system.open_rom`. The state file now includes a `romLoaded` flag. Any edit to
 `src/bizhawk_debug_api.lua` only takes effect after you reload the script
 (Lua Console → Script → Restart, or relaunch BizHawk).
+
+**Commands time out after restarting the MCP server (without reloading the Lua)**
+A restarted server reconnects its socket and resets its command-id counter to a
+low value. The bridge handles both now: `checkSocketCommands` accepts a fresh
+connection even while holding a stale one (a half-open old socket that never
+reports "closed" no longer blocks it), and `checkFileCommands` processes a
+command whenever the id *changes* rather than requiring a strictly higher id.
+If you still see timeouts right after a server restart, just send one more
+command — the bridge re-syncs on the next request.
 
 **Lua Console says "Available Memory Domains:" with NES domains (RAM, PALRAM, etc.)**
 You loaded a NES ROM by mistake. Close + load the NDS ROM.

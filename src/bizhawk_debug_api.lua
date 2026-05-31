@@ -1386,6 +1386,82 @@ local function processCommand(cmd)
         emu.frameadvance()
         response.data = { pressed = btn, frames = frames }
 
+    elseif action == "input.sequence" then
+        -- Run several input steps in ONE command, so a whole navigation
+        -- sequence costs a single round trip instead of one per button.
+        -- `seq` is a FLAT string (this JSON parser is flat-only, no nested
+        -- arrays): steps separated by ";", fields by spaces.
+        --   press <BTN> [frames]      e.g. "press A 8"
+        --   touch <x> <y> [frames]    e.g. "touch 128 96 8"
+        --   wait <frames>             e.g. "wait 8"   (emulated frames)
+        --   sleep <seconds>           e.g. "sleep 1.5" (wall-clock real time)
+        -- Example: seq = "press A; press Right; press Down; press A; touch 128 96"
+        -- (omitted frame counts default to 8, matching input.press / input.touch).
+        local seq = cmd.seq or ""
+        isPausedState = false
+        currentState = STATE_RUNNING
+        local results = {}
+        for stepStr in (seq .. ";"):gmatch("([^;]+);") do
+            local tok = {}
+            for w in stepStr:gmatch("%S+") do tok[#tok + 1] = w end
+            local kind = tok[1]
+            if kind == "press" then
+                local btn = tok[2] or "A"
+                local fr = tonumber(tok[3]) or 8
+                local k1, k2 = "P1 " .. btn, btn
+                for _ = 1, fr do
+                    if client.unpause then client.unpause() end
+                    joypad.set({ [k1] = true, [k2] = true })
+                    emu.frameadvance()
+                end
+                if client.unpause then client.unpause() end
+                joypad.set({ [k1] = false, [k2] = false })
+                emu.frameadvance()
+                results[#results + 1] = "press " .. btn .. " x" .. fr
+            elseif kind == "touch" then
+                local x = tonumber(tok[2]) or 128
+                local y = tonumber(tok[3]) or 96
+                local fr = tonumber(tok[4]) or 8
+                for _ = 1, fr do
+                    if client.unpause then client.unpause() end
+                    local ds = joypad.get() or {}
+                    ds["Touch"] = true; ds["Touch X"] = x; ds["Touch Y"] = y
+                    joypad.set(ds)
+                    joypad.setanalog({ ["Touch X"] = x, ["Touch Y"] = y })
+                    emu.frameadvance()
+                end
+                if client.unpause then client.unpause() end
+                -- release the digital touch (do NOT re-issue setanalog here:
+                -- a sticky analog touch gets XOR'd to the mouse position and
+                -- would register as a stray touch on later frames).
+                joypad.set({ ["Touch"] = false })
+                emu.frameadvance()
+                results[#results + 1] = "touch " .. x .. "," .. y .. " x" .. fr
+            elseif kind == "wait" then
+                local fr = tonumber(tok[2]) or 8
+                for _ = 1, fr do emu.frameadvance() end
+                results[#results + 1] = "wait " .. fr
+            elseif kind == "sleep" then
+                -- Wall-clock wait: advance frames until N real seconds have
+                -- elapsed (socket.gettime() is wall-clock, sub-second). Lets a
+                -- sequence be specified in real time; the game keeps running
+                -- during the wait. Faster-than-native speed just advances more
+                -- frames in the same real time (harmless on a settled screen).
+                local secs = tonumber(tok[2]) or 1
+                if socket and socket.gettime then
+                    local deadline = socket.gettime() + secs
+                    while socket.gettime() < deadline do
+                        emu.frameadvance()
+                    end
+                else
+                    -- LuaSocket unavailable: approximate at 60 fps.
+                    for _ = 1, math.floor(secs * 60) do emu.frameadvance() end
+                end
+                results[#results + 1] = "sleep " .. secs .. "s"
+            end
+        end
+        response.data = { ran = #results, steps = results }
+
     elseif action == "system.reset" then
         -- Hard reset / power cycle the emulator core.
         -- client.reboot_core() can leave the emulator paused; explicitly
@@ -1721,6 +1797,21 @@ end
 local function checkSocketCommands()
     if not SOCKET_ENABLED or not socketInitialized then return false end
 
+    -- If a new client connects while we still hold one, the old one is dead
+    -- (the MCP server connects once per run, so a fresh connection means it
+    -- restarted). Swap to the new client and drop the stale one. Otherwise a
+    -- half-open old socket (which never reports "closed") silently swallows
+    -- every future command and hangs the bridge until a Lua reload.
+    if socketClient then
+        local newClient = socketServer:accept()
+        if newClient then
+            pcall(function() socketClient:close() end)
+            newClient:settimeout(0)
+            socketClient = newClient
+            console.log("[SOCKET] New client replaced a stale connection")
+        end
+    end
+
     -- Accept new connection if no current client
     if not socketClient then
         local client, err = socketServer:accept()
@@ -1768,12 +1859,19 @@ end
 
 
 -- Check for file-based commands (fallback)
+local lastFileCommandId = nil
 local function checkFileCommands()
     local content = readFile(COMMAND_FILE)
     if not content or content == "" then return end
 
     local cmd = parseJson(content)
-    if not cmd or not cmd.id or cmd.id <= lastCommandId then return end
+    if not cmd or not cmd.id then return end
+    -- Process whenever the id CHANGES, not only when it increases. After the
+    -- MCP server restarts its id counter resets to a low value; the old
+    -- "id <= lastCommandId" test rejected every post-restart command because
+    -- the previous session's id was still higher, hanging the file fallback.
+    if cmd.id == lastFileCommandId then return end
+    lastFileCommandId = cmd.id
 
     lastCommandId = cmd.id
     log("[FILE] Processing command: " .. tostring(cmd.action) .. " (id=" .. tostring(cmd.id) .. ")")

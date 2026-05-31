@@ -63,7 +63,8 @@ logger.info(f"State file: {STATE_FILE}")
 command_id = 0
 
 # Timeout configuration - BizHawk is more reliable, can use shorter timeouts
-DEFAULT_TIMEOUT = 10.0  # seconds
+DEFAULT_TIMEOUT = 30.0  # seconds (file-fallback). Must cover a full batched
+# input.sequence navigation (with multi-second wall-clock sleeps).
 FAST_TIMEOUT = 5.0      # for simple operations
 
 # Description suffix for all tools
@@ -144,7 +145,11 @@ def check_bizhawk_alive() -> tuple[bool, str]:
 
 SOCKET_HOST = "127.0.0.1"
 SOCKET_PORT = 9876
-SOCKET_TIMEOUT = 2.0  # seconds
+SOCKET_TIMEOUT = 30.0  # seconds. Must exceed the longest single command's
+# execution time. input.sequence runs many frame advances / wall-clock sleeps
+# in one command (a batched navigation sequence with real-time waits), so keep
+# this generous enough that a full boot-to-screen batch never trips the socket
+# read timeout and falls back to file.
 socket_connection = None
 
 
