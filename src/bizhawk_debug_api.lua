@@ -1675,23 +1675,42 @@ end
 -- STATE UPDATE
 -- ═══════════════════════════════════════════════════════════════
 
+-- True only when a real core/ROM is loaded. With no ROM, BizHawk runs the
+-- "NULL" core and most emu.* calls (frameadvance, getregisters, framecount)
+-- error or hang, so callers must guard on this.
+local function romLoaded()
+    local ok, sid = pcall(emu.getsystemid)
+    return ok and sid ~= nil and sid ~= "NULL"
+end
+
+-- Write the heartbeat/state file. Every field is read defensively so this
+-- ALWAYS reaches writeFile() — even with no ROM loaded. If it could throw,
+-- the timestamp would stop advancing and MCP would treat the bridge as stale
+-- even though the script is still alive.
 local function updateState()
+    local function safe(fn, default)
+        local ok, v = pcall(fn)
+        if ok and v ~= nil then return v end
+        return default
+    end
+    local loaded = romLoaded()
     local state = {
         -- State
         state = currentState,
         isPaused = isPausedState,
-        -- Game info
-        frameCount = emu.framecount(),
-        cpu = CPU.getRegisters(),
-        watched = Watch.list(),
-        breakpoints = #Breakpoints.list(),
+        romLoaded = loaded,
+        -- Game info (only read core-dependent values when a ROM is loaded)
+        frameCount = loaded and safe(emu.framecount, 0) or 0,
+        cpu = loaded and safe(CPU.getRegisters, {}) or {},
+        watched = safe(Watch.list, {}),
+        breakpoints = safe(function() return #Breakpoints.list() end, 0),
         tracing = traceEnabled,
         timestamp = os.time(),
         -- BizHawk specific
         emulator = "BizHawk",
-        core = emu.getsystemid()
+        core = safe(emu.getsystemid, "NULL")
     }
-    writeFile(STATE_FILE, toJson(state))
+    pcall(function() writeFile(STATE_FILE, toJson(state)) end)
 end
 
 -- ═══════════════════════════════════════════════════════════════
@@ -1816,15 +1835,26 @@ writeFile(COMMAND_FILE, '{"id":0}')
 updateState()
 
 console.log("BizHawk Debug API Ready!")
-console.log("System: " .. emu.getsystemid())
+do
+    -- Guarded: with no ROM loaded these can error; the script must still
+    -- reach the main loop so it can service an open_rom command.
+    local ok, sid = pcall(emu.getsystemid)
+    console.log("System: " .. (ok and tostring(sid) or "NULL (no ROM loaded)"))
+end
 console.log("")
 
 
--- List memory domains for reference
-local domains = memory.getmemorydomainlist()
-console.log("Available Memory Domains:")
-for i, domain in ipairs(domains) do
-    console.log("  " .. i .. ". " .. domain)
+-- List memory domains for reference (only meaningful with a core loaded)
+do
+    local ok, domains = pcall(memory.getmemorydomainlist)
+    if ok and domains then
+        console.log("Available Memory Domains:")
+        for i, domain in ipairs(domains) do
+            console.log("  " .. i .. ". " .. domain)
+        end
+    else
+        console.log("Memory domains unavailable (no ROM loaded yet)")
+    end
 end
 console.log("")
 
@@ -1834,37 +1864,43 @@ console.log("")
 
 while true do
     frameCounter = frameCounter + 1
-    
-    -- Check for commands
-    checkCommands()
-    
-    -- Update state periodically (every 10 frames)
+
+    -- Every step below is pcall-guarded so a transient error (most often a
+    -- core-dependent read issued while no ROM is loaded) can never escape and
+    -- kill this loop. If the loop dies the heartbeat stops and MCP reports a
+    -- stale bridge — the exact failure we are guarding against.
+    pcall(checkCommands)
+
+    -- Heartbeat / state (every 10 frames). updateState is self-guarding and
+    -- always writes a fresh timestamp, even with no ROM loaded.
     if frameCounter % 10 == 0 then
-        updateState()
+        pcall(updateState)
     end
-    
-    -- Log instruction if tracing
+
     if traceEnabled then
-        Trace.logInstruction()
+        pcall(Trace.logInstruction)
     end
-    
-    -- Apply frozen values (write every frame to maintain cheats)
-    Freeze.apply()
-    
-    -- Frame advance - but handle paused state to keep processing commands
-    -- CRITICAL FIX: emu.frameadvance() BLOCKS when paused, preventing command processing
-    -- We must check BizHawk's ACTUAL pause state (not just our flag) — if the
-    -- user pressed Pause in BizHawk's UI, emu.frameadvance() would hang
-    -- here, the main loop would freeze, and MCP would see "stale bridge".
-    -- yield() keeps the script alive without trying to advance frames.
-    local bizhawkPaused = false
-    if client.ispaused then
+
+    -- Apply frozen values (maintain cheats); no-op when none are set.
+    pcall(Freeze.apply)
+
+    -- Decide whether to advance a frame. emu.frameadvance() must NOT run when
+    -- no ROM is loaded (it errors/hangs on the NULL core) or when the
+    -- emulator is paused. In those cases emu.yield() hands control back to
+    -- BizHawk (GUI stays responsive, script stays alive) without advancing.
+    -- Exactly one of frameadvance/yield runs each iteration, so the script
+    -- always returns time to the emulator and never spins.
+    local advance = romLoaded()
+    if advance and isPausedState then advance = false end
+    if advance and client.ispaused then
         local ok, p = pcall(client.ispaused)
-        if ok then bizhawkPaused = p end
+        if ok and p then advance = false end
     end
-    if isPausedState or bizhawkPaused then
-        emu.yield()
+    if advance then
+        if not pcall(emu.frameadvance) then
+            emu.yield()  -- frameadvance failed unexpectedly; still yield
+        end
     else
-        emu.frameadvance()
+        emu.yield()
     end
 end

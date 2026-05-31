@@ -137,6 +137,17 @@ Inherited actions still work: `memory.read`, `memory.write`, `memory.readRange`,
 
 ## Troubleshooting
 
+**Bridge goes stale ("BizHawk not responding") after closing the ROM, or when started with no ROM**
+With no ROM loaded BizHawk runs the "NULL" core, where `emu.frameadvance()`,
+`emu.getregisters()` and `emu.framecount()` error or hang. The main loop now
+guards against this: it only advances frames while a ROM is loaded (otherwise
+it yields), every loop step is `pcall`-wrapped so a single error can't kill the
+loop, and the heartbeat (`debug_state.json`) is written every cycle even with no
+ROM — so the bridge stays alive across `system.close_rom` and resumes on
+`system.open_rom`. The state file now includes a `romLoaded` flag. Any edit to
+`src/bizhawk_debug_api.lua` only takes effect after you reload the script
+(Lua Console → Script → Restart, or relaunch BizHawk).
+
 **Lua Console says "Available Memory Domains:" with NES domains (RAM, PALRAM, etc.)**
 You loaded a NES ROM by mistake. Close + load the NDS ROM.
 
