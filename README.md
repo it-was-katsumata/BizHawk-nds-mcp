@@ -1,4 +1,4 @@
-# 🎮 BizHawk Debug Server — Nintendo DS fork
+# 🎮 BizHawk-nds-mcp — Nintendo DS debug bridge
 
 **Python MCP server + Lua bridge for AI-driven Nintendo DS reverse engineering in BizHawk (MelonDS core).**
 
@@ -42,8 +42,8 @@ VRAMCNT, and BG tilemaps.
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/it-was-katsumata/BizHawk-mcp.git
-   cd BizHawk-mcp
+   git clone https://github.com/it-was-katsumata/BizHawk-nds-mcp.git
+   cd BizHawk-nds-mcp
    ```
 
 2. **Install dependencies** (just the `mcp` Python SDK):
