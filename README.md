@@ -192,8 +192,9 @@ the DS-specific helpers are reached through `emu_debug_raw_command`.
 
 ## 📄 License
 
-MIT License. This is an NDS-focused fork of an upstream NES debug bridge; the
-original work and this fork are both MIT licensed.
+MIT License — see [LICENSE](LICENSE). This is an NDS-focused fork of an upstream
+NES debug bridge; the LICENSE credits both the original author and this fork's
+changes.
 
 ---
 
