@@ -1,6 +1,6 @@
 """
 BizHawk MCP Server
-Model Context Protocol server for NES game debugging with BizHawk/EmuHawk emulator
+Model Context Protocol server for Nintendo DS game debugging with BizHawk/EmuHawk (MelonDS core)
 
 IMPORTANT: All tools in this server operate ONLY on volatile emulator runtime state.
 They do NOT modify files, server code, or configuration.
@@ -83,7 +83,7 @@ FREEZE_FEATURE_ENABLED = False  # Default: Disabled - enable manually when neede
 
 def normalize_address(addr: str) -> int:
     """Convert address string to integer for consistent comparison.
-    Handles: 0x075A, $075A, 075A, 1882 (decimal)
+    Handles: 0x02000000, $02000000, 02000000, 33554432 (decimal)
     """
     if isinstance(addr, int):
         return addr
@@ -290,7 +290,7 @@ def read_state() -> dict:
 
 
 # Create MCP Server
-server = Server("bizhawk-nes")
+server = Server("bizhawk-nds")
 logger.info("BizHawk MCP Server instance created")
 
 
@@ -304,7 +304,7 @@ async def list_tools() -> list[Tool]:
         # ═══════════════════════════════════════════════════════════════
         Tool(
             name="emu_debug_read_memory",
-            description="Read a byte from emulator RAM/ROM at the specified address. Address can be hex (0x075A or $075A) or decimal. Optional domain: 'System Bus', 'RAM', 'PRG ROM', etc." + RUNTIME_DISCLAIMER,
+            description="Read a byte from emulator RAM/ROM at the specified address. Address can be hex (0x02000000 or $02000000) or decimal. Optional domain: 'System Bus', 'Main RAM', 'OAM', etc." + RUNTIME_DISCLAIMER,
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -374,7 +374,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="emu_debug_list_memory_domains",
-            description="Get list of available emulator memory domains (RAM, PRG ROM, CHR ROM, etc.)." + RUNTIME_DISCLAIMER,
+            description="Get list of available emulator memory domains (Main RAM, Shared WRAM, VRAM, OAM, etc.)." + RUNTIME_DISCLAIMER,
             inputSchema={"type": "object", "properties": {}}
         ),
         
@@ -491,28 +491,7 @@ async def list_tools() -> list[Tool]:
             description="Clear the emulator breakpoint hit queue." + RUNTIME_DISCLAIMER,
             inputSchema={"type": "object", "properties": {}}
         ),
-        
-        # ═══════════════════════════════════════════════════════════════
-        # DISASSEMBLY (Emulator Runtime Only)
-        # ═══════════════════════════════════════════════════════════════
-        Tool(
-            name="emu_debug_disassemble",
-            description="Get disassembly (assembly code) at an emulator memory address. Returns instruction bytes, mnemonic, and operand." + RUNTIME_DISCLAIMER,
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "address": {"type": "string", "description": "Start address for disassembly"},
-                    "count": {"type": "integer", "description": "Number of instructions (default=20)"}
-                },
-                "required": ["address"]
-            }
-        ),
-        Tool(
-            name="emu_debug_get_current_instruction",
-            description="Get the instruction at the current emulated Program Counter (PC)." + RUNTIME_DISCLAIMER,
-            inputSchema={"type": "object", "properties": {}}
-        ),
-        
+
         # ═══════════════════════════════════════════════════════════════
         # TRACE LOGGER (Emulator Runtime Only)
         # ═══════════════════════════════════════════════════════════════
@@ -823,16 +802,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             result = send_command("breakpoint.getLastHit")
         elif name == "emu_debug_clear_breakpoint_hits":
             result = send_command("breakpoint.clearHits")
-        
-        # ═══════════════════════════════════════════════════════════════
-        # DISASSEMBLY
-        # ═══════════════════════════════════════════════════════════════
-        elif name == "emu_debug_disassemble":
-            result = send_command("disasm.get",
-                                 address=arguments.get("address"),
-                                 count=arguments.get("count", 20))
-        elif name == "emu_debug_get_current_instruction":
-            result = send_command("disasm.current")
         
         # ═══════════════════════════════════════════════════════════════
         # TRACE LOGGER

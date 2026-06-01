@@ -1,6 +1,4 @@
-English | [العربية](API_README.ar.md)
-
-# BizHawk MCP Debug API Reference
+# BizHawk MCP Debug API Reference (NDS fork)
 
 > ⚠️ **IMPORTANT**: All tools operate **ONLY on volatile emulator runtime state**. They do **NOT** modify files, server code, configuration, or the host system.
 
@@ -18,20 +16,30 @@ English | [العربية](API_README.ar.md)
 | `emu_debug_compare_memory` | Compare RAM to snapshot | `name?`, `filter?` |
 | `emu_debug_list_memory_domains` | List available memory domains | — |
 
-### Memory Domains
+The `address` parameter accepts hex strings (`0x06600000` or `$06600000`) as well
+as decimal. Prefer hex strings to avoid manual hex-to-decimal conversion mistakes.
 
-| Domain | Size | Description |
-|--------|------|-------------|
-| `System Bus` | 64KB | Full address space (default) |
-| `RAM` | 2KB | Work RAM |
-| `PALRAM` | 32B | PPU color palette |
-| `OAM` | 256B | Sprite attribute memory |
-| `PRG ROM` | varies | Program ROM |
-| `CHR` / `CHR VROM` | varies | Graphics ROM |
+### Memory Domains (MelonDS)
+
+Run `emu_debug_list_memory_domains` to get the exact names your BizHawk build
+exposes (they can vary slightly by version). Typical MelonDS domains:
+
+| Domain | Description |
+|--------|-------------|
+| `System Bus` / `ARM9 System Bus` / `ARM7 System Bus` | Address by physical DS address (default). 0x02000000 main RAM, 0x04000000 I/O, 0x05000000 palette, 0x06xxxxxx VRAM, 0x07000000 OAM |
+| `Main RAM` | 4 MB main work RAM (0x02000000) |
+| `Shared WRAM` / `ARM7 WRAM` | Shared and ARM7 work RAM |
+| `ARM9 ITCM` / `ARM9 DTCM` | ARM9 tightly-coupled memory |
+| `Main Palette` / `Sub Palette` | Engine A / Engine B BG+OBJ palettes |
+| `OAM` | Sprite attribute memory (both engines) |
+| `VRAM` | Video RAM (often a flat block from 0x06000000) |
+| `ARM9 BIOS` / `ARM7 BIOS` | BIOS regions |
 
 ---
 
 ## CPU Tools
+
+Returns the ARM9 / ARM7 registers exposed by the MelonDS core.
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
@@ -66,12 +74,13 @@ English | [العربية](API_README.ar.md)
 
 ---
 
-## Disassembly & Trace
+## Trace
+
+Trace entries record the program counter, the raw opcode byte at the PC, and the
+core's register snapshot per logged step.
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
-| `emu_debug_disassemble` | Disassemble at address | `address`, `count?` |
-| `emu_debug_get_current_instruction` | Get instruction at PC | — |
 | `emu_debug_start_trace` | Start trace logging | — |
 | `emu_debug_stop_trace` | Stop trace logging | — |
 | `emu_debug_get_trace` | Get trace entries | `count?` |
@@ -133,22 +142,25 @@ English | [العربية](API_README.ar.md)
 
 ## Usage Examples
 
-### Change Palette Colors
+### Inspect the current scene's sprites
 ```
-1. "Read PALRAM from address 0 to 31"
-2. "Write value 42 (green) to PALRAM address 17"
-```
-
-### Find a Memory Address
-```
-1. "Search memory for value 3" (initial lives)
-2. Lose a life, then "Search memory for value 2"
-3. "Add a write breakpoint at $075A"
+1. "Read POWCNT" (powcnt.read — which engine drives which screen)
+2. "Parse the sub-engine OAM" (oam.parse engine=sub)
+3. "Take a screenshot to dumps/scene.png"
 ```
 
-### Infinite Lives Cheat
+### Find a memory address that changes
 ```
-1. "Freeze address $075A to value 9"
+1. "Snapshot main RAM"
+2. Trigger the in-game change (spend money, take damage, ...)
+3. "Compare main RAM to the snapshot, filter to decreased values"
+4. "Add a write breakpoint at the candidate address"
+```
+
+### Read by physical DS address
+```
+1. "Read 64 bytes from 0x02000000" (main RAM via System Bus)
+2. "Read 32 bytes from 0x05000000" (BG/OBJ palette)
 ```
 
 ### Trace Execution
@@ -161,7 +173,14 @@ English | [العربية](API_README.ar.md)
 
 ### Automate Input
 ```
-1. "Set input to press A button"
-2. "Advance 10 frames"
-3. "Clear input"
+1. "Press A for 8 frames" (input.press)
+2. "Touch the bottom screen at (128, 96)" (input.touch — see the touchscreen note in NDS_SETUP.md)
+3. "Run a batched navigation sequence" (input.sequence)
+```
+
+### Patch and reload a ROM without restarting BizHawk
+```
+1. "Close the ROM" (system.close_rom — releases the file lock)
+2. Run your patcher, overwriting the .nds on disk
+3. "Open the patched ROM" (system.open_rom path=...)
 ```

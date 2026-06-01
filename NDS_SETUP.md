@@ -1,23 +1,27 @@
-# NDS Setup — `C:\BizHawk-mcp` fork
+# NDS Setup
+
+Setup guide for the NDS fork of the BizHawk debug bridge. Paths below use
+placeholders like `<venv>` (your Python environment) and `<your-rom>.nds` —
+substitute your own. `<repo>` is wherever you cloned this repository.
 
 ## Prerequisites
 
-1. **BizHawk 2.10+** for Windows ([releases](https://github.com/TASEmulators/BizHawk/releases)).  Verified on **2.11.1** at `E:\Emulators\BizHawk-2.11.1-win-x64\`.
-2. **Python 3.10+** (the existing project venv at `C:\ds_translation_patch\venv\` will work).
-3. **NDS ROM + matching `.dsv` save** in a known location (`C:\ds_translation_patch\roms\YNAJA4_00.nds` + `YNAJA4_00.dsv`).
+1. **BizHawk 2.10+** for Windows ([releases](https://github.com/TASEmulators/BizHawk/releases)). Verified on **2.11.1**.
+2. **Python 3.10+** (a virtual environment is recommended; referred to as `<venv>` below).
+3. **NDS ROM + matching `.dsv` save** in a known location (`<your-rom>.nds` + `<your-rom>.dsv`).
 
 ## One-time setup
 
 ### Step 1 — Python dependencies
 
 ```powershell
-C:\ds_translation_patch\venv\Scripts\pip.exe install mcp
+<venv>\Scripts\pip.exe install mcp
 ```
 
-The only required dep is the `mcp` Python SDK (≥1.0). If you see `ModuleNotFoundError: No module named 'mcp'` when Claude Code tries to launch the server, this step was skipped. Confirm with:
+The only required dep is the `mcp` Python SDK (≥1.0). If you see `ModuleNotFoundError: No module named 'mcp'` when the client tries to launch the server, this step was skipped. Confirm with:
 
 ```powershell
-C:\ds_translation_patch\venv\Scripts\python.exe C:\BizHawk-mcp\src\bizhawk_mcp_server.py
+<venv>\Scripts\python.exe <repo>\src\bizhawk_mcp_server.py
 ```
 
 — it should print `BizHawk MCP Server starting...` and then wait for stdio. Ctrl+C to exit.
@@ -25,36 +29,24 @@ C:\ds_translation_patch\venv\Scripts\python.exe C:\BizHawk-mcp\src\bizhawk_mcp_s
 ### Step 2 — Verify BizHawk + MelonDS
 
 1. Launch `EmuHawk.exe`.
-2. **File → Open ROM** → pick `C:\ds_translation_patch\roms\YNAJA4_00.nds`.
+2. **File → Open ROM** → pick `<your-rom>.nds`.
 3. **Nintendo DS** should show in the status bar. The first time you load an NDS ROM, BizHawk may prompt you to point at firmware/BIOS; if so, just dismiss — MelonDS has built-in HLE that works without real firmware.
-4. **Place the matching `.dsv`** next to the ROM (already at `C:\ds_translation_patch\roms\YNAJA4_00.dsv`).
+4. **Place the matching `.dsv`** next to the ROM.
 5. Play until **Continue** is selectable. Load it. You should reach the in-game state.
 
 ### Step 3 — Capture save-state slots (optional but recommended)
 
-In-game, press `Shift+F1..F10` to save to slots 1..10. Suggested slots:
-
-| Slot | Scene |
-|---|---|
-| 1 | System menu (the Save/Options/Quit Game/Back screen) |
-| 2 | Main room (post-load default) |
-| 3 | Location list (action menu → Go Out) |
-| 4 | Shop |
-| 5 | Notebook |
-| 6 | Fashion / dressing room |
-| 7 | Card game / Sevens |
-| 8 | Schedule / calendar |
-| 9 | A dialogue scene with choices |
-| 10 | End-of-scene selection |
-
-Each save state lets me jump straight to that scene from Claude via `state.load slot=N`.
+In-game, press `Shift+F1..F10` to save to slots 1..10. Capture a slot for each
+scene you expect to revisit (menus, shops, dialogue screens, etc.) so an agent
+can jump straight there via `state.load slot=N` instead of replaying the
+navigation each time.
 
 State files live in BizHawk's `SaveStates/` folder by default.
 
 ### Step 4 — Load the Lua bridge
 
 1. In BizHawk: **Tools → Lua Console**.
-2. **Script → Open Script** → pick `C:\BizHawk-mcp\src\bizhawk_debug_api.lua`.
+2. **Script → Open Script** → pick `<repo>\src\bizhawk_debug_api.lua`.
 3. Lua Console should print:
    ```
    ╔═══════════════════════════════════════════╗
@@ -74,26 +66,27 @@ State files live in BizHawk's `SaveStates/` folder by default.
 
 Leave the Lua Console open and the script running for the duration of the session.
 
-### Step 5 — Register the MCP server with Claude Code
+### Step 5 — Register the MCP server with your client
 
-Open `%USERPROFILE%\.claude\settings.json` and add (or merge):
+For Claude Code, open `%USERPROFILE%\.claude\settings.json` and add (or merge),
+substituting your own venv and repo paths:
 
 ```json
 {
   "mcpServers": {
     "bizhawk": {
-      "command": "C:\\ds_translation_patch\\venv\\Scripts\\python.exe",
-      "args": ["C:\\BizHawk-mcp\\src\\bizhawk_mcp_server.py"]
+      "command": "<venv>\\Scripts\\python.exe",
+      "args": ["<repo>\\src\\bizhawk_mcp_server.py"]
     }
   }
 }
 ```
 
-Restart Claude Code. Next session, tools prefixed `mcp__bizhawk__emu_debug_*` should be available.
+Restart the client. Next session, tools prefixed `mcp__bizhawk__emu_debug_*` should be available.
 
 ## Smoke test
 
-Once both BizHawk + Lua bridge + Claude MCP are running, from Claude:
+Once BizHawk, the Lua bridge, and the MCP server are all running, from your client:
 
 ```
 mcp__bizhawk__emu_debug_get_emulator_state()
@@ -121,7 +114,7 @@ emu_debug_raw_command(action="screenshot.take", params={"path": "C:/tmp/shot.png
 | `input.touch` | `x, y, frames=8` | touches at (x, y) for N frames + releases. **Requires the mouse-rebind workaround documented in Troubleshooting** — without it, mouse XOR forces the tap to land at cursor position regardless of (x, y). |
 | `input.touch_release` | — | releases Touch and clears the analog autoholds |
 | `input.press` | `button="A", frames=8` | press one button for N frames then release. Avoids the nested-object JSON quirk in `input.set`. |
-| `input.sequence` | `seq="press A; sleep 6; press A; sleep 2.5; press A; sleep 8; press Right; sleep 0.4; press Down; sleep 0.4; press A; sleep 1"` | runs several input steps in ONE command (one round trip for a whole navigation sequence instead of one per button). `seq` is a flat string: steps split by `;`, fields by spaces. Step forms: `press <BTN> [frames]`, `touch <x> <y> [frames]`, `wait <frames>` (emulated frames, default 8), `sleep <seconds>` (wall-clock real time, advances frames meanwhile). Use `sleep` between screen transitions so the next input lands after the game has settled. Prefer `press A`/`press B` over `touch` for "touch to continue" / menu screens — a `touch` lands at fixed coords and can hit the wrong button. The socket and file timeouts are 30s (see `SOCKET_TIMEOUT` / `DEFAULT_TIMEOUT`), so a full ~20s boot-to-screen batch fits in one command. The example above is the verified NANA boot→Fashion navigation. |
+| `input.sequence` | `seq="press A; sleep 6; press A; sleep 2.5; press A; sleep 8; press Right; sleep 0.4; press Down; sleep 0.4; press A; sleep 1"` | runs several input steps in ONE command (one round trip for a whole navigation sequence instead of one per button). `seq` is a flat string: steps split by `;`, fields by spaces. Step forms: `press <BTN> [frames]`, `touch <x> <y> [frames]`, `wait <frames>` (emulated frames, default 8), `sleep <seconds>` (wall-clock real time, advances frames meanwhile). Use `sleep` between screen transitions so the next input lands after the game has settled. Prefer `press A`/`press B` over `touch` for "touch to continue" / menu screens — a `touch` lands at fixed coords and can hit the wrong button. The socket and file timeouts are 30s (see `SOCKET_TIMEOUT` / `DEFAULT_TIMEOUT`), so a full ~20s boot-to-screen batch fits in one command. The example above is an illustrative boot-to-in-game navigation (skip the boot splash, pick a menu entry, then move the cursor and confirm). |
 | `input.debug` | — | returns the full `joypad.get()` / `joypad.get(1)` / `joypad.getimmediate(1)` maps so you can discover which key names the current core exposes. Critical for NDS where touch keys are `Touch X` / `Touch Y` with a literal space, not `TouchX` / `TouchY`. |
 | `frame.advance` | `frames=1` | advances N frames |
 | `screenshot.take` | `path` | saves screen to PNG file |
