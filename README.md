@@ -10,7 +10,11 @@ VRAMCNT, and BG tilemaps.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> ⚠️ **IMPORTANT**: All tools operate **ONLY on volatile emulator runtime state**. They do **NOT** modify files, server code, configuration, or the host system.
+> ⚠️ **Scope**: tools act on the running emulator. A few also touch host files:
+> `emu_debug_save_state` writes savestates, and `raw_command` actions such as
+> `screenshot.take`, `memory.dump_to_file` and `system.open_rom` read or write
+> paths you give them. Every tool carries MCP `readOnlyHint` / `destructiveHint`
+> annotations so clients can tell them apart.
 
 ---
 
@@ -18,11 +22,11 @@ VRAMCNT, and BG tilemaps.
 
 | Feature | Description |
 |---------|-------------|
-| 🧠 **Memory Access** | Read/write/search/snapshot/compare across MelonDS domains (Main RAM, Shared WRAM, VRAM, Main/Sub Palette, OAM, …) or by physical address via System Bus |
-| 🔍 **CPU State** | Read the ARM9 / ARM7 registers exposed by MelonDS |
-| ⏸️ **Execution Control** | Pause, resume, step, and frame-advance |
-| 🎯 **Breakpoints** | Read / write / execute breakpoints with auto-pause |
-| 📝 **Trace Logging** | Record instruction execution and find hotspots |
+| 🧠 **Memory Access** | Read/write/search/snapshot/compare by physical DS address via `ARM9 System Bus` (default), or by offset in MelonDS domains (`Main RAM`, `Shared WRAM`, `Instruction TCM`, `Data TCM`, …). Search/snapshot sweep all 4 MB of main RAM |
+| 🔍 **CPU State** | ARM9 / ARM7 registers r0–r15 (BizHawk exposes no CPSR) |
+| ⏸️ **Execution Control** | Pause, resume, and frame-advance (works while paused) |
+| 🎯 **Breakpoints** | Read / write / execute memory callbacks with hit log and optional auto-pause (MelonDS JIT must be off) |
+| 📝 **Trace** | Record executed ARM9 instruction addresses or count hotspots via exec callbacks (CPU-intensive) |
 | 💾 **Save States** | Save / load numbered slots or explicit file paths |
 | 🕹️ **DS Input** | Buttons, touchscreen taps, and batched navigation sequences |
 | 📸 **Screen Capture** | Save either screen to PNG for visual verification |
@@ -34,8 +38,8 @@ VRAMCNT, and BG tilemaps.
 ## 🚀 Quick Start
 
 ### Prerequisites
-- [BizHawk](https://github.com/TASEmulators/BizHawk/releases) **2.10+** (verified on 2.11.1) with the **MelonDS** core
-- **Python 3.10+**
+- [BizHawk](https://github.com/TASEmulators/BizHawk/releases) **2.10+** with the **MelonDS** core. **2.11.1 recommended**: it fixes 16/32-bit reads on the MelonDS system bus and passes the real value to memory callbacks (2.10 always reports 0)
+- **Python 3.10+** (the `mcp` SDK 1.30+ or 2.x; both are supported)
 - An **NDS ROM** (plus its matching `.dsv` save, if you want to resume in-game)
 
 ### Installation
@@ -77,11 +81,13 @@ AI agent  ──MCP/stdio──►  bizhawk_mcp_server.py  ──TCP 127.0.0.1:9
 ```
 
 The server exposes each capability as an MCP tool (e.g. `emu_debug_read_memory`,
-`emu_debug_raw_command`). It forwards commands to the Lua bridge over a localhost
-**socket** (port `9876`), automatically falling back to a **JSON file** exchange
-(`src/debug_commands.json` → `src/debug_response.json`) if the socket is
-unavailable. A heartbeat file (`src/debug_state.json`) lets the server detect a
-stale or closed bridge. All of these runtime files are git-ignored.
+`emu_debug_raw_command`). Commands normally travel through a **JSON file**
+exchange (`src/debug_commands.json` → `src/debug_response.json`). If you have
+installed LuaSocket for BizHawk (it isn't bundled), the bridge also listens on
+**TCP** `127.0.0.1:9876` and the server uses that first; a command that may
+already be running is never re-sent over the file channel. A heartbeat file
+(`src/debug_state.json`) lets the server detect a stale or closed bridge. All of
+these runtime files are git-ignored.
 
 ---
 
@@ -117,7 +123,7 @@ emu_debug_raw_command(action="screenshot.take",
 **4. Inspect the graphics hardware for the current scene.**
 ```
 emu_debug_raw_command(action="powcnt.read")
-# → { powcnt1: 0x820F, lcd_swap: true, ... }   (which engine drives which screen)
+# → { powcnt1: 0x820F, lcd_swap: true, engine_a_screen: "top", ... }   (which engine drives which screen)
 
 emu_debug_raw_command(action="oam.parse", params={ engine: "sub" })
 # → { sprites: [ { idx: 0, x: 4, y: 8, tile: 0, w_tiles: 4, h_tiles: 4, palette: 5 }, ... ] }
@@ -169,7 +175,8 @@ the DS-specific helpers are reached through `emu_debug_raw_command`.
 |-------|---------|
 | Input | `input.set`, `input.touch`, `input.touch_release`, `input.press`, `input.sequence`, `input.debug` |
 | Flow | `frame.advance`, `system.reset`, `system.close_rom`, `system.open_rom` |
-| Capture | `screenshot.take` |
+| Capture | `screenshot.take`, `memory.dump_to_file` |
+| Trace | `trace.hotspots` |
 | Graphics | `powcnt.read`, `dispcnt.decode`, `vramcnt.decode`, `bg.read`, `oam.parse` |
 
 ---
@@ -181,12 +188,32 @@ the DS-specific helpers are reached through `emu_debug_raw_command`.
 │   ├── bizhawk_debug_api.lua    # BizHawk Lua bridge (load in Lua Console)
 │   └── bizhawk_mcp_server.py    # Python MCP server (socket + file IPC)
 ├── lua/
-│   └── socket.lua               # LuaSocket shim (upstream; optional)
+│   └── socket.lua               # LuaSocket shim (upstream; needs the native socket.core)
+├── tests/                       # Lua bridge + server tests against a BizHawk mock
 ├── requirements.txt             # Python dependencies (mcp SDK)
+├── requirements-dev.txt         # + lupa (Lua 5.4) and pytest for the tests
 ├── README.md                    # This file
 ├── API_README.md                # Core MCP tool reference
 └── NDS_SETUP.md                 # Full NDS setup + DS action reference + troubleshooting
 ```
+
+---
+
+## 🧪 Tests
+
+The test suite runs the real `src/bizhawk_debug_api.lua` under Lua 5.4 (the
+version BizHawk embeds) against `tests/bizhawk_mock.lua`, a stand-in for the
+BizHawk API modelled on BizHawk's source (zero-indexed domain list, MelonDS
+register names, frame-advance blocking while paused, …), and drives the MCP
+server end to end over file IPC and stdio. No emulator or ROM needed:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests
+```
+
+It cannot catch everything a real core does (timing, touch/XOR quirks), so
+still smoke-test in EmuHawk after changing the bridge.
 
 ---
 

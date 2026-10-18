@@ -1,6 +1,11 @@
 # BizHawk MCP Debug API Reference (NDS fork)
 
-> ⚠️ **IMPORTANT**: All tools operate **ONLY on volatile emulator runtime state**. They do **NOT** modify files, server code, configuration, or the host system.
+> ⚠️ **Scope**: tools act on the running emulator; `emu_debug_save_state` and some
+> `emu_debug_raw_command` actions also write host files. Each tool carries MCP
+> `readOnlyHint` / `destructiveHint` annotations.
+
+Failed calls come back with `success: false`, a top-level `error`, and the MCP
+`isError` flag set.
 
 ---
 
@@ -10,41 +15,47 @@
 |------|-------------|------------|
 | `emu_debug_read_memory` | Read byte from address | `address`, `domain?` |
 | `emu_debug_write_memory` | Write byte to address | `address`, `value`, `domain?` |
-| `emu_debug_read_memory_range` | Read byte range | `address`, `length`, `domain?` |
-| `emu_debug_search_memory` | Search for value in RAM | `value` |
-| `emu_debug_snapshot_memory` | Take RAM snapshot | `name?` |
-| `emu_debug_compare_memory` | Compare RAM to snapshot | `name?`, `filter?` |
+| `emu_debug_read_memory_range` | Read byte range (max 65536) | `address`, `length`, `domain?` |
+| `emu_debug_search_memory` | Search for a byte value (default: all of main RAM) | `value`, `domain?`, `start?`, `length?` |
+| `emu_debug_snapshot_memory` | Take a snapshot (default: all of main RAM) | `name?`, `domain?`, `start?`, `length?` |
+| `emu_debug_compare_memory` | Compare memory to snapshot | `name?`, `filter?` |
 | `emu_debug_list_memory_domains` | List available memory domains | — |
 
 The `address` parameter accepts hex strings (`0x06600000` or `$06600000`) as well
 as decimal. Prefer hex strings to avoid manual hex-to-decimal conversion mistakes.
+Search and compare return at most 1000 entries; the response's `total` gives the
+full count. An unknown `domain` is an error (BizHawk itself would silently use
+the current domain instead).
 
 ### Memory Domains (MelonDS)
 
-Run `emu_debug_list_memory_domains` to get the exact names your BizHawk build
-exposes (they can vary slightly by version). Typical MelonDS domains:
+What BizHawk 2.10 / 2.11.x expose for NDS (run `emu_debug_list_memory_domains`
+to confirm on your build):
 
 | Domain | Description |
 |--------|-------------|
-| `System Bus` / `ARM9 System Bus` / `ARM7 System Bus` | Address by physical DS address (default). 0x02000000 main RAM, 0x04000000 I/O, 0x05000000 palette, 0x06xxxxxx VRAM, 0x07000000 OAM |
-| `Main RAM` | 4 MB main work RAM (0x02000000) |
+| `ARM9 System Bus` (default) / `ARM7 System Bus` | Address by physical DS address: 0x02000000 main RAM, 0x04000000 I/O, 0x05000000 palette, 0x06xxxxxx VRAM, 0x07000000 OAM |
+| `Main RAM` | 4 MB main work RAM; offset 0 = bus 0x02000000 |
 | `Shared WRAM` / `ARM7 WRAM` | Shared and ARM7 work RAM |
-| `ARM9 ITCM` / `ARM9 DTCM` | ARM9 tightly-coupled memory |
-| `Main Palette` / `Sub Palette` | Engine A / Engine B BG+OBJ palettes |
-| `OAM` | Sprite attribute memory (both engines) |
-| `VRAM` | Video RAM (often a flat block from 0x06000000) |
-| `ARM9 BIOS` / `ARM7 BIOS` | BIOS regions |
+| `Instruction TCM` / `Data TCM` | ARM9 tightly-coupled memory |
+| `ARM9 BIOS` / `ARM7 BIOS` / `Firmware` | BIOS and firmware images |
+| `SRAM` / `ROM` | Cartridge save memory and ROM image |
+
+There are no separate palette, VRAM or OAM domains: read those through
+`ARM9 System Bus`.
 
 ---
 
 ## CPU Tools
 
-Returns the ARM9 / ARM7 registers exposed by the MelonDS core.
+Returns ARM9 and ARM7 registers r0–r15 (`sp`=r13, `lr`=r14, `pc`=r15) from the
+MelonDS core. BizHawk exposes no CPSR, so there are no flags or Thumb bit, and
+r15 is the core's pipelined PC (ahead of the executing instruction).
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
-| `emu_debug_get_cpu_state` | Get full CPU state with flags | — |
-| `emu_debug_get_cpu_registers` | Get registers in hex format | — |
+| `emu_debug_get_cpu_state` | Registers as numbers, per CPU | — |
+| `emu_debug_get_cpu_registers` | Registers as hex strings, per CPU | — |
 
 ---
 
@@ -54,12 +65,19 @@ Returns the ARM9 / ARM7 registers exposed by the MelonDS core.
 |------|-------------|------------|
 | `emu_debug_pause` | Pause emulator | — |
 | `emu_debug_resume` | Resume emulator | — |
-| `emu_debug_step` | Step frame or instruction | `count?`, `stepType?` |
+| `emu_debug_step` | Advance frames (`stepType` must be `frame`; MelonDS cannot single-step instructions) | `count?`, `stepType?` |
 | `emu_debug_frame_advance` | Advance frames | `count?` |
+
+Both frame tools work while paused and leave the emulator paused.
 
 ---
 
 ## Breakpoints
+
+Breakpoints are BizHawk memory callbacks on `ARM9 System Bus`. MelonDS only
+supports them with JIT disabled (NDS sync settings). Auto-pause takes effect at
+the end of the frame, not at the instruction. Execute breakpoints report the
+exact instruction address as `PC`; read/write hits report the pipelined r15.
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
@@ -76,12 +94,14 @@ Returns the ARM9 / ARM7 registers exposed by the MelonDS core.
 
 ## Trace
 
-Trace entries record the program counter, the raw opcode byte at the PC, and the
-core's register snapshot per logged step.
+Tracing registers an exec callback that fires before every ARM9 instruction, so
+emulation slows down heavily while it runs (JIT must be off). `start_trace`
+records the addresses of the next `limit` instructions and stops by itself;
+`emu_debug_trace_and_summarize` counts executed addresses over a few frames.
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
-| `emu_debug_start_trace` | Start trace logging | — |
+| `emu_debug_start_trace` | Record the next N executed instruction addresses | `limit?` (≤1000) |
 | `emu_debug_stop_trace` | Stop trace logging | — |
 | `emu_debug_get_trace` | Get trace entries | `count?` |
 | `emu_debug_clear_trace` | Clear trace log | — |
@@ -104,8 +124,8 @@ core's register snapshot per logged step.
 | Tool | Description | Parameters |
 |------|-------------|------------|
 | `emu_debug_get_emulator_state` | Get emulator state | — |
-| `emu_debug_save_state` | Save emulator state | `slot?`, `path?` |
-| `emu_debug_load_state` | Load emulator state | `slot?`, `path?` |
+| `emu_debug_save_state` | Save state to slot 1-10 or a file (writes to disk) | `slot?`, `path?` |
+| `emu_debug_load_state` | Load state (fails if the slot/file is missing) | `slot?`, `path?` |
 | `emu_debug_set_input` | Set controller input | `buttons?`, `player?` |
 | `emu_debug_raw_command` | Send raw command | `action`, `params?` |
 
@@ -125,9 +145,9 @@ core's register snapshot per logged step.
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
-| `emu_cheat_find_decrementing_value` | Find values that decrease over time | `initialValue?`, `frames?` |
+| `emu_cheat_find_decrementing_value` | Find main RAM bytes that decrease over time | `initialValue?`, `frames?`, `minDecrement?` |
 | `emu_cheat_find_value_on_event` | Two-phase value finder | `phase`, `snapshotName?`, `filter?` |
-| `emu_cheat_narrow_candidates` | Narrow candidate addresses | `addresses`, `action`, `filter?` |
+| `emu_cheat_narrow_candidates` | Narrow candidate addresses (anywhere on the ARM9 bus, within a 4 MB span) | `addresses`, `action`, `filter?` |
 
 ---
 
@@ -136,7 +156,15 @@ core's register snapshot per logged step.
 | Tool | Description | Parameters |
 |------|-------------|------------|
 | `emu_debug_capture_write_source` | Monitor what writes to an address | `address`, `frames?` |
-| `emu_debug_trace_and_summarize` | Trace and find execution hotspots | `frames?`, `topN?` |
+| `emu_debug_trace_and_summarize` | Count executed-instruction hotspots (slow; default 1 frame, max 60) | `frames?`, `topN?` |
+
+---
+
+## Raw command parameter names
+
+When calling the bridge directly (`emu_debug_raw_command` or the file protocol),
+`id` is reserved for the command envelope. Use `bpId` for `breakpoint.remove`
+and `freezeId` for `freeze.remove`.
 
 ---
 
@@ -166,7 +194,7 @@ core's register snapshot per logged step.
 ### Trace Execution
 ```
 1. "Pause the emulator"
-2. "Start trace logging"
+2. "Start trace logging" (records the next 1000 instruction addresses)
 3. "Advance 1 frame"
 4. "Show me the trace log"
 ```

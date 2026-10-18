@@ -15,10 +15,10 @@ substitute your own. `<repo>` is wherever you cloned this repository.
 ### Step 1 — Python dependencies
 
 ```powershell
-<venv>\Scripts\pip.exe install mcp
+<venv>\Scripts\pip.exe install -r <repo>\requirements.txt
 ```
 
-The only required dep is the `mcp` Python SDK (≥1.0). If you see `ModuleNotFoundError: No module named 'mcp'` when the client tries to launch the server, this step was skipped. Confirm with:
+The only required dep is the `mcp` Python SDK (1.30+ or 2.x; the server supports both). If you see `ModuleNotFoundError: No module named 'mcp'` when the client tries to launch the server, this step was skipped. Confirm with:
 
 ```powershell
 <venv>\Scripts\python.exe <repo>\src\bizhawk_mcp_server.py
@@ -57,24 +57,36 @@ State files live in BizHawk's `SaveStates/` folder by default.
    System: NDS
    ...
    Available Memory Domains:
-     1. ARM9 System Bus
-     2. ARM7 System Bus
-     3. Main RAM
+     1. Main RAM
+     2. Shared WRAM
+     3. ARM7 WRAM
      ...
+     ARM9 System Bus
+     ARM7 System Bus
    ```
 4. Confirm `System: NDS` (not `NES`) — that's the signal we're on the right core.
+5. For breakpoints and tracing, keep **JIT disabled** in the NDS sync settings:
+   MelonDS only supports BizHawk memory callbacks with the interpreter.
 
 Leave the Lua Console open and the script running for the duration of the session.
 
 ### Step 5 — Register the MCP server with your client
 
-For Claude Code, open `%USERPROFILE%\.claude\settings.json` and add (or merge),
-substituting your own venv and repo paths:
+For Claude Code, register it with the CLI (Claude Code does not read MCP servers
+from `settings.json`), substituting your own venv and repo paths:
+
+```powershell
+claude mcp add --transport stdio --scope user bizhawk -- <venv>\Scripts\python.exe <repo>\src\bizhawk_mcp_server.py
+```
+
+`--scope user` makes it available in every project (stored in `~/.claude.json`).
+To share it with a project instead, commit a `.mcp.json` at the project root:
 
 ```json
 {
   "mcpServers": {
     "bizhawk": {
+      "type": "stdio",
       "command": "<venv>\\Scripts\\python.exe",
       "args": ["<repo>\\src\\bizhawk_mcp_server.py"]
     }
@@ -82,7 +94,8 @@ substituting your own venv and repo paths:
 }
 ```
 
-Restart the client. Next session, tools prefixed `mcp__bizhawk__emu_debug_*` should be available.
+Start a new session (or run `/mcp` to check the connection). Tools prefixed
+`mcp__bizhawk__emu_debug_*` should be available.
 
 ## Smoke test
 
@@ -98,7 +111,7 @@ Then try the NDS-specific actions via `emu_debug_raw_command`:
 
 ```
 emu_debug_raw_command(action="powcnt.read")
-# → { powcnt1: 0x820F, lcd_swap: true, engine_a_screen: "bottom", ... }
+# → { powcnt1: 0x820F, lcd_swap: true, engine_a_screen: "top", ... }
 
 emu_debug_raw_command(action="oam.parse", params={"engine": "sub"})
 # → { sprites: [{idx: 0, y: 8, x: 4, tile: 0, w_tiles: 4, h_tiles: 4, ...}, ...] }
@@ -110,24 +123,26 @@ emu_debug_raw_command(action="screenshot.take", params={"path": "C:/tmp/shot.png
 
 | action | params | returns |
 |---|---|---|
-| `input.set` | `buttons={A=true, Touch=true, "Touch X"=128, "Touch Y"=96}` | digital buttons via `joypad.set`, numeric `Touch X`/`Touch Y` routed to `joypad.setanalog`. Accepts both `"Touch X"` (with space, the canonical NDS name) and `"TouchX"` (normalized). |
+| `input.set` | `buttons={A=true, Touch=true, "Touch X"=128, "Touch Y"=96}` | digital buttons via `joypad.set` (NDS names are unprefixed: `A`, `Up`, `Touch`), numeric `Touch X`/`Touch Y` routed to `joypad.setanalog`. Accepts both `"Touch X"` (with space, the canonical NDS name) and `"TouchX"` (normalized). Buttons apply to the next frame; touch coords are sticky autoholds until `input.touch_release`. |
 | `input.touch` | `x, y, frames=8` | touches at (x, y) for N frames + releases. **Requires the mouse-rebind workaround documented in Troubleshooting** — without it, mouse XOR forces the tap to land at cursor position regardless of (x, y). |
 | `input.touch_release` | — | releases Touch and clears the analog autoholds |
-| `input.press` | `button="A", frames=8` | press one button for N frames then release. Avoids the nested-object JSON quirk in `input.set`. |
+| `input.press` | `button="A", frames=8` | press one button for N frames then release. |
 | `input.sequence` | `seq="press A; sleep 6; press A; sleep 2.5; press A; sleep 8; press Right; sleep 0.4; press Down; sleep 0.4; press A; sleep 1"` | runs several input steps in ONE command (one round trip for a whole navigation sequence instead of one per button). `seq` is a flat string: steps split by `;`, fields by spaces. Step forms: `press <BTN> [frames]`, `touch <x> <y> [frames]`, `wait <frames>` (emulated frames, default 8), `sleep <seconds>` (wall-clock real time, advances frames meanwhile). Use `sleep` between screen transitions so the next input lands after the game has settled. Prefer `press A`/`press B` over `touch` for "touch to continue" / menu screens — a `touch` lands at fixed coords and can hit the wrong button. The socket and file timeouts are 30s (see `SOCKET_TIMEOUT` / `DEFAULT_TIMEOUT`), so a full ~20s boot-to-screen batch fits in one command. The example above is an illustrative boot-to-in-game navigation (skip the boot splash, pick a menu entry, then move the cursor and confirm). |
 | `input.debug` | — | returns the full `joypad.get()` / `joypad.get(1)` / `joypad.getimmediate(1)` maps so you can discover which key names the current core exposes. Critical for NDS where touch keys are `Touch X` / `Touch Y` with a literal space, not `TouchX` / `TouchY`. |
-| `frame.advance` | `frames=1` | advances N frames |
+| `frame.advance` | `frames=1` | advances N frames (works while paused; stays paused) |
 | `screenshot.take` | `path` | saves screen to PNG file |
+| `memory.dump_to_file` | `address, length, path, domain?` | writes raw bytes to a file (for large regions such as VRAM or a whole RAM image) |
+| `trace.hotspots` | `frames=1, topN=20` | counts executed ARM9 instruction addresses over N frames (≤60; very slow while running, JIT must be off) |
 | `system.reset` | — | hard reset / power cycle. Unpauses + clears all button autoholds. |
 | `system.close_rom` | — | unloads the current ROM (releases the file handle so a patcher can overwrite). |
 | `system.open_rom` | `path` | loads a ROM by absolute path. Pair with `system.close_rom` for a patch-and-reload cycle. |
-| `powcnt.read` | — | POWCNT1 + decoded LCD swap state |
+| `powcnt.read` | — | POWCNT1 + decoded LCD swap state (bit 15 set = engine A on the top screen) and engine A/B enables |
 | `dispcnt.decode` | `engine="main"|"sub"` | DISPCNT decoded into BG enables / OBJ / mode / 1D mapping / boundary |
-| `vramcnt.decode` | — | VRAMCNT_A..I decoded (enable / mst / offset) |
-| `bg.read` | `engine, index=0..3` | BG CNT + 24×32 tilemap entries |
+| `vramcnt.decode` | — | VRAMCNT_A..I decoded (enable / mst / offset); H/I are read from 0x04000248/9, past WRAMCNT |
+| `bg.read` | `engine, index=0..3` | BG CNT + 24×32 tilemap entries (text BGs). Map/tile addresses include engine A's DISPCNT screen/char base |
 | `oam.parse` | `engine` | list of visible sprites with shape/size/tile/palette |
 
-Inherited actions still work: `memory.read`, `memory.write`, `memory.readRange`, `state.save`, `state.load`, `execution.pause/resume/step`, `freeze.add/remove`, etc.
+Inherited actions still work: `memory.read`, `memory.write`, `memory.readRange`, `state.save`, `state.load`, `execution.pause/resume/step`, `freeze.add/remove`, etc. `id` is reserved for the command envelope, so `breakpoint.remove` takes `bpId` and `freeze.remove` takes `freezeId`.
 
 ## Troubleshooting
 
@@ -136,7 +151,7 @@ With no ROM loaded BizHawk runs the "NULL" core, where `emu.frameadvance()`,
 `emu.getregisters()` and `emu.framecount()` error or hang. The main loop now
 guards against this: it only advances frames while a ROM is loaded (otherwise
 it yields), every loop step is `pcall`-wrapped so a single error can't kill the
-loop, and the heartbeat (`debug_state.json`) is written every cycle even with no
+loop, and the heartbeat (`debug_state.json`) is written every 10 loop iterations even with no
 ROM — so the bridge stays alive across `system.close_rom` and resumes on
 `system.open_rom`. The state file now includes a `romLoaded` flag. Any edit to
 `src/bizhawk_debug_api.lua` only takes effect after you reload the script
@@ -154,17 +169,22 @@ command — the bridge re-syncs on the next request.
 **Lua Console says "Available Memory Domains:" with NES domains (RAM, PALRAM, etc.)**
 You loaded a NES ROM by mistake. Close + load the NDS ROM.
 
-**`memory.usememorydomain("Main RAM")` errors**
-The exact domain name may differ across BizHawk versions. Run from Lua Console:
+**A memory domain seems to be missing**
+`memory.getmemorydomainlist()` is zero-indexed, so a Lua Console loop with
+`ipairs` skips the first entry (`Main RAM`). List them with:
 ```lua
-for i, d in ipairs(memory.getmemorydomainlist()) do console.log(i .. ": " .. d) end
+local d = memory.getmemorydomainlist(); for i = 0, #d do console.log(i .. ": " .. d[i]) end
 ```
-Pick the closest name and update `DEFAULT_RAM_DOMAIN` in `src/bizhawk_debug_api.lua`.
+or call `emu_debug_list_memory_domains`, which returns the full list.
+
+**Breakpoints or tracing fail with "Could not register memory callback"**
+MelonDS only supports memory callbacks with JIT disabled. Turn JIT off in the
+NDS sync settings and reload the ROM.
 
 **MCP tools don't appear in Claude Code**
-- Confirm `settings.json` syntax is valid JSON.
-- Restart Claude Code (settings only re-read on session start).
-- Check the Python server runs standalone: `python C:\BizHawk-mcp\src\bizhawk_mcp_server.py` — should print `MCP server started`.
+- Run `claude mcp list` and check `bizhawk` is listed and connected (`/mcp` inside a session).
+- Start a new session after adding the server.
+- Check the Python server runs standalone: `python <repo>\src\bizhawk_mcp_server.py` — should print `BizHawk MCP Server starting...`.
 
 **`screenshot.take` returns "screenshot failed"**
 Ensure the output directory exists. BizHawk won't create it.
@@ -176,7 +196,12 @@ BizHawk 2.10+ has a regression: the touch axes go through an
 (mouse) and sticky input (Lua autohold) are non-neutral. Since the
 mouse is almost never at a precisely neutral position, every Lua
 `joypad.setanalog` call for `Touch X` / `Touch Y` is XOR'd to the
-mouse cursor position. See [issue #4535](https://github.com/TASEmulators/BizHawk/issues/4535).
+mouse cursor position. See [issue #4535](https://github.com/TASEmulators/BizHawk/issues/4535)
+(still open as of October 2026; a fix for the Lua side was proposed in
+[PR #4804](https://github.com/TASEmulators/BizHawk/pull/4804) — check whether
+your build includes it). The maintainers' suggested workaround is to unbind the
+mouse from all three touch controls (`Touch`, `Touch X`, `Touch Y`) where your
+build allows it.
 
 **Workaround (both parts required):**
 
