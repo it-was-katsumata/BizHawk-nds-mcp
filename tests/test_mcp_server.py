@@ -3,8 +3,6 @@ the Lua bridge running against the BizHawk mock."""
 
 import asyncio
 import json
-import socket
-import threading
 
 
 def call(srv, name, **arguments):
@@ -130,56 +128,6 @@ def test_tool_calls_do_not_block_the_event_loop(server):
         return ticks
 
     assert asyncio.run(scenario()) > 5
-
-
-def test_socket_timeout_does_not_rerun_command_over_file(server, monkeypatch):
-    # A socket peer that accepts the command but never answers. The command
-    # may already be running in BizHawk, so it must not be re-sent via file.
-    lsock = socket.socket()
-    lsock.bind(("127.0.0.1", 0))
-    lsock.listen(1)
-    received = []
-
-    def peer():
-        conn, _ = lsock.accept()
-        received.append(conn.recv(4096))
-        threading.Event().wait(2)
-        conn.close()
-
-    threading.Thread(target=peer, daemon=True).start()
-    monkeypatch.setattr(server, "SOCKET_PORT", lsock.getsockname()[1])
-    monkeypatch.setattr(server, "SOCKET_TIMEOUT", 0.5)
-    server.close_socket_connection()
-    r = call(server, "emu_debug_raw_command", action="frame.advance", params={"frames": 1})
-    assert "error" in r
-    assert received and b"frame.advance" in received[0]
-    with open(server.COMMAND_FILE, encoding="utf-8") as f:
-        assert json.load(f).get("action") != "frame.advance"
-    server.close_socket_connection()
-    lsock.close()
-
-
-def test_socket_closed_by_peer_falls_back_to_file(server, monkeypatch):
-    # A stale connection (e.g. the Lua script was reloaded) is closed by the
-    # peer without a reply: nothing is running the command, so retry via file.
-    lsock = socket.socket()
-    lsock.bind(("127.0.0.1", 0))
-    lsock.listen(1)
-
-    def peer():
-        conn, _ = lsock.accept()
-        conn.recv(4096)
-        conn.close()
-
-    threading.Thread(target=peer, daemon=True).start()
-    monkeypatch.setattr(server, "SOCKET_PORT", lsock.getsockname()[1])
-    server.close_socket_connection()
-    with server.bridge.lock:
-        server.bridge.mock.poke(0x02000700, 0x3C)
-    r = call(server, "emu_debug_read_memory", address="0x02000700")
-    assert r["success"] is True and r["data"] == 0x3C
-    server.close_socket_connection()
-    lsock.close()
 
 
 def test_narrow_candidates_rejects_huge_span(server):

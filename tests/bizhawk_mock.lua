@@ -145,7 +145,25 @@ client = {}
 function client.pause() Mock.paused = true end
 function client.unpause() Mock.paused = false end
 function client.ispaused() return Mock.paused end
-function client.screenshot(path) Mock.screenshots[#Mock.screenshots + 1] = path end
+-- Like EmuHawk, saves synchronously; tests put PNG bytes in Mock.screenshotPng.
+function client.screenshot(path)
+    Mock.screenshots[#Mock.screenshots + 1] = path
+    if Mock.screenshotPng then
+        local f = assert(io.open(path, "wb"))
+        f:write(Mock.screenshotPng)
+        f:close()
+    end
+end
+
+-- comm: by default EmuHawk was started without --socket_ip/--socket_port,
+-- in which case socketServerGetInfo() logs and returns "". Tests replace
+-- `comm` with a live client (conftest.FakeBizHawkSocketClient).
+comm = {
+    socketServerGetInfo = function()
+        Mock.logs[#Mock.logs + 1] = "Socket server was not initialized, please initialize it via the command line"
+        return ""
+    end,
+}
 function client.reboot_core() Mock.frame = 0 end
 function client.closerom() Mock.system = "NULL" end
 function client.openrom(path) Mock.system = "NDS"; Mock.openedRom = path end

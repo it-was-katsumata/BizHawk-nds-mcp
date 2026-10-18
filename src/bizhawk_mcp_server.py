@@ -15,6 +15,10 @@ import json
 import os
 import sys
 import time
+import base64
+import io
+import socket
+import struct
 import logging
 import logging.handlers
 import threading
@@ -41,7 +45,7 @@ logger.info(f"Log file: {LOG_FILE}")
 
 # MCP imports
 from mcp.server import Server
-from mcp.types import Tool, TextContent, ToolAnnotations, CallToolResult, ListToolsResult
+from mcp.types import Tool, TextContent, ImageContent, ToolAnnotations, CallToolResult, ListToolsResult
 from mcp.server.stdio import stdio_server
 logger.info("MCP package imported successfully")
 
@@ -76,6 +80,21 @@ REGION_PROPERTIES = {
     "start": {"type": "string", "description": "Start address (optional; default 0x02000000 on the system buses, 0 in other domains)"},
     "length": {"type": "integer", "description": "Bytes to scan (optional; default 4194304 = all of main RAM)"},
 }
+# Multi-byte values (Lua checkSize / packValue)
+SIZE_PROPERTY = {"type": "integer", "enum": [1, 2, 4],
+                 "description": "Value width in bytes, little-endian (default 1). DS games mostly use 2 or 4."}
+ALIGNED_PROPERTY = {"type": "boolean",
+                    "description": "For size 2/4: only addresses that are a multiple of size (default true)"}
+SIGNED_PROPERTY = {"type": "boolean",
+                   "description": "Treat values as signed when judging increased/decreased (default false)"}
+
+DS_BUTTONS = ["A", "B", "X", "Y", "L", "R", "Up", "Down", "Left", "Right", "Start", "Select"]
+ENGINE_PROPERTY = {"type": "string", "enum": ["main", "sub"],
+                   "description": "Graphics engine: 'main' (engine A, default) or 'sub' (engine B); emu_ds_read_powcnt says which screen each drives"}
+FRAMES_PROPERTY = {"type": "integer", "minimum": 1, "description": "Frames to hold (default 8)"}
+
+# Temporary file emu_ds_screenshot asks BizHawk to write (deleted after reading)
+SCREENSHOT_FILE = os.path.join(BASE_PATH, "debug_screenshot.png")
 
 # ═══════════════════════════════════════════════════════════════
 # FREEZE FEATURE CONFIGURATION
@@ -135,14 +154,14 @@ def read_json_file(path: str, attempts: int = 5) -> dict:
             time.sleep(0.02)
 
 
-def write_command_file(command: dict) -> None:
-    """Write the command atomically so Lua never parses a half-written file."""
-    tmp = COMMAND_FILE + ".tmp"
+def write_json_atomic(path: str, obj: dict) -> None:
+    """Write JSON via a temp file + rename so Lua never parses a half-written file."""
+    tmp = path + ".tmp"
     with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(command, f)
+        json.dump(obj, f)
     for i in range(20):
         try:
-            os.replace(tmp, COMMAND_FILE)
+            os.replace(tmp, path)
             return
         except PermissionError:
             # Windows: Lua has the file open for reading this instant.
@@ -153,6 +172,8 @@ def write_command_file(command: dict) -> None:
 
 def check_bizhawk_alive() -> tuple[bool, str]:
     """Check if BizHawk + Lua script are running by checking state file timestamp"""
+    if comm_bridge.connected():
+        return True, "OK"  # the bridge is talking to us right now
     try:
         if not os.path.exists(STATE_FILE):
             return False, "State file not found. Start BizHawk, load ROM, then load bizhawk_debug_api.lua in Tools > Lua Console"
@@ -174,48 +195,264 @@ def check_bizhawk_alive() -> tuple[bool, str]:
 
 
 # ═══════════════════════════════════════════════════════════════
-# SOCKET CONFIGURATION (NEW - Fast Communication)
+# SOCKET TRANSPORT (BizHawk's built-in comm.socketServer* client)
 # ═══════════════════════════════════════════════════════════════
+#
+# EmuHawk's Lua can only open outbound sockets, so this server listens and
+# bizhawk_debug_api.lua connects to it, when EmuHawk was started with
+# --socket_ip=127.0.0.1 --socket_port=<SOCKET_PORT>. The SOCKET CONFIGURATION
+# block in the Lua script describes the protocol and the BizHawk quirks it
+# works around. Without a live connection, commands use the JSON files.
 
 SOCKET_HOST = "127.0.0.1"
-SOCKET_PORT = 9876
-SOCKET_TIMEOUT = 30.0  # seconds. Must exceed the longest single command's
-# execution time. input.sequence runs many frame advances / wall-clock sleeps
-# in one command (a batched navigation sequence with real-time waits), so keep
-# this generous enough that a full boot-to-screen batch never trips the socket
-# read timeout and falls back to file.
-socket_connection = None
+# BIZHAWK_MCP_PORT: port to listen on (default 9876, matching --socket_port);
+# "off" disables the listener; 0 picks any free port.
+_port_setting = os.environ.get("BIZHAWK_MCP_PORT", "9876").strip().lower()
+try:
+    SOCKET_PORT = None if _port_setting in ("", "off", "none") else int(_port_setting)
+except ValueError:
+    logger.warning(f"BIZHAWK_MCP_PORT={_port_setting!r} is not a port number; socket listener off")
+    SOCKET_PORT = None
+SERVER_INFO_FILE = os.path.join(BASE_PATH, "debug_server.json")
+HANDOVER_TIMEOUT = 2.0  # seconds for the bridge to pick a command up before using files
+LIVE_WINDOW = 2.0       # the connection counts as live if the bridge spoke this recently
+
+# struct linger {on, seconds=0}: close() aborts with RST instead of FIN.
+_LINGER_ABORT = struct.pack("HH" if sys.platform == "win32" else "ii", 1, 0)
 
 
-def get_socket_connection():
-    """Get or create socket connection to BizHawk"""
-    global socket_connection
-    
-    if socket_connection is not None:
-        return socket_connection
-    
+def _frame(payload: str) -> bytes:
+    """BizHawk 2.6.2+ socket framing: "<byte length> <payload>"."""
+    data = payload.encode("utf-8")
+    return str(len(data)).encode("ascii") + b" " + data
+
+
+class _FrameReader:
+    """Buffered reader of framed messages. Not socket.makefile(): its extra
+    reference defers close(), and with it the RST that _abort relies on."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._buf = bytearray()
+
+    def _fill(self) -> None:
+        chunk = self._conn.recv(65536)
+        if not chunk:
+            raise ConnectionError("connection closed")
+        self._buf += chunk
+
+    def read(self) -> str:
+        while (sp := self._buf.find(b" ")) < 0:
+            if len(self._buf) > 10:
+                raise ConnectionError("bad frame prefix")
+            self._fill()
+        digits = bytes(self._buf[:sp])
+        if not digits.isdigit():
+            raise ConnectionError(f"bad frame prefix {digits!r}")
+        end = sp + 1 + int(digits)
+        while len(self._buf) < end:
+            self._fill()
+        data = bytes(self._buf[sp + 1:end])
+        del self._buf[:end]
+        return data.decode("utf-8", errors="replace")
+
+
+def _abort(conn) -> None:
+    """Close with RST, never a graceful FIN: BizHawk's ReceiveString spins
+    forever if the peer closes gracefully while it reads a length prefix."""
     try:
-        import socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(SOCKET_TIMEOUT)
-        sock.connect((SOCKET_HOST, SOCKET_PORT))
-        socket_connection = sock
-        logger.info(f"[SOCKET] Connected to BizHawk on port {SOCKET_PORT}")
-        return sock
-    except Exception as e:
-        logger.debug(f"[SOCKET] Connection failed: {e}")
-        return None
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, _LINGER_ABORT)
+    except OSError:
+        pass
+    try:
+        conn.shutdown(socket.SHUT_RD)  # wakes a reader blocked in recv; sends nothing
+    except OSError:
+        pass
+    try:
+        conn.close()
+    except OSError:
+        pass
 
 
-def close_socket_connection():
-    """Close socket connection"""
-    global socket_connection
-    if socket_connection:
+class CommBridge:
+    """Listener and message pump for the Lua bridge's socket client.
+
+    The bridge sends READY or "RESULT <json>" once per loop iteration and
+    expects an immediate answer: NONE or the next command. Every message
+    gets exactly one answer; after a missed answer the bridge sends another
+    READY, so answers may run one behind, which is harmless because a
+    command is only ever handed over once. send() parks a command for the
+    reader thread to hand over, then waits for its RESULT.
+    """
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._stop = threading.Event()
+        self._listener = None
+        self._conn = None
+        self._gen = 0             # connection generation; readers of old ones exit
+        self._last_heard = 0.0    # time.monotonic() of the bridge's last message
+        self._outbox = None       # command waiting to be handed over
+        self._handed = None       # id of the command the bridge is running
+        self._results = {}
+        self.port = None
+
+    def start(self, host: str = SOCKET_HOST, port: int | None = None) -> bool:
+        port = SOCKET_PORT if port is None else port
+        if port is None:
+            return False
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if os.name != "nt":
+            # POSIX: allow rebinding over TIME_WAIT (on Windows this flag
+            # would instead let another process share the port).
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            socket_connection.close()
-        except:
+            listener.bind((host, port))
+            listener.listen(1)
+        except OSError as e:
+            listener.close()
+            logger.warning(f"[SOCKET] Cannot listen on {host}:{port} ({e}); using file IPC only")
+            return False
+        self._listener = listener
+        self.port = listener.getsockname()[1]
+        threading.Thread(target=self._accept_loop, daemon=True, name="bizhawk-accept").start()
+        threading.Thread(target=self._announce_loop, daemon=True, name="bizhawk-announce").start()
+        logger.info(f"[SOCKET] Listening on {host}:{self.port} for EmuHawk (--socket_port={self.port})")
+        return True
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._listener:
+            self._listener.close()
+        with self._cond:
+            conn, self._conn = self._conn, None
+            self._gen += 1
+            self._fail_handed("The MCP server stopped")
+            self._cond.notify_all()
+        if conn:
+            _abort(conn)
+        try:
+            with open(SERVER_INFO_FILE, encoding="utf-8") as f:
+                mine = json.load(f).get("pid") == os.getpid()
+            if mine:
+                os.remove(SERVER_INFO_FILE)
+        except (OSError, ValueError):
             pass
-        socket_connection = None
+
+    def connected(self) -> bool:
+        with self._cond:
+            return self._conn is not None and time.monotonic() - self._last_heard < LIVE_WINDOW
+
+    def send(self, command: dict, timeout: float) -> dict | None:
+        """Run a command over the socket. None means it never reached the
+        bridge, so the caller may safely use file IPC instead. Once handed
+        over it is never re-sent: the bridge may be running it."""
+        cid = command["id"]
+        with self._cond:
+            if self._conn is None or time.monotonic() - self._last_heard >= LIVE_WINDOW:
+                return None
+            self._outbox = command
+            handover_deadline = time.monotonic() + HANDOVER_TIMEOUT
+            while self._outbox is command:
+                remaining = handover_deadline - time.monotonic()
+                if self._conn is None or remaining <= 0:
+                    self._outbox = None
+                    return None
+                self._cond.wait(remaining)
+            deadline = time.monotonic() + timeout
+            while cid not in self._results:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    if self._handed == cid:
+                        self._handed = None  # a late RESULT is then ignored
+                    return {"error": f"Timeout after {timeout}s waiting for BizHawk over the socket. "
+                                     "The command may still be running; not re-sending.", "commandId": cid}
+                self._cond.wait(remaining)
+            return self._results.pop(cid)
+
+    def _fail_handed(self, reason: str) -> None:
+        """Caller holds the lock."""
+        if self._handed is not None:
+            self._results[self._handed] = {
+                "error": f"{reason} while BizHawk had the command; not re-sending (it may have run).",
+                "commandId": self._handed}
+            self._handed = None
+
+    def _accept_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._listener.accept()
+            except OSError:
+                return  # listener closed
+            # Set from the start so that even this process dying aborts with RST.
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, _LINGER_ABORT)
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            with self._cond:
+                old, self._conn = self._conn, conn
+                self._gen += 1
+                gen = self._gen
+                self._last_heard = 0.0
+                # The bridge only reconnects from its main loop, so a command
+                # handed over on the old connection lost its result.
+                self._fail_handed("BizHawk reconnected")
+                self._cond.notify_all()
+            if old:
+                _abort(old)
+            logger.info("[SOCKET] EmuHawk connected")
+            threading.Thread(target=self._reader, args=(conn, gen), daemon=True,
+                             name="bizhawk-reader").start()
+
+    def _reader(self, conn, gen: int) -> None:
+        frames = _FrameReader(conn)
+        try:
+            while True:
+                msg = frames.read()
+                with self._cond:
+                    if gen != self._gen:
+                        return
+                    self._last_heard = time.monotonic()
+                    if msg.startswith("RESULT "):
+                        try:
+                            resp = json.loads(msg[len("RESULT "):])
+                        except ValueError:
+                            resp = {"error": "Unreadable result from the bridge",
+                                    "commandId": self._handed}
+                        if self._handed is not None and resp.get("commandId") == self._handed:
+                            self._results[self._handed] = resp
+                            self._handed = None
+                    reply = "NONE"
+                    if self._outbox is not None and self._handed is None:
+                        reply = json.dumps(self._outbox)
+                        self._handed = self._outbox["id"]
+                        self._outbox = None
+                    self._cond.notify_all()
+                    # Answer at once, under the lock, so a hand-over and its
+                    # send can't interleave with another connection's.
+                    conn.sendall(_frame(reply))
+        except (OSError, ConnectionError) as e:
+            logger.info(f"[SOCKET] EmuHawk connection ended ({e})")
+        finally:
+            with self._cond:
+                if gen == self._gen:
+                    self._conn = None
+                    self._fail_handed("Lost the connection to BizHawk")
+                    self._cond.notify_all()
+            _abort(conn)
+
+    def _announce_loop(self) -> None:
+        """Refresh debug_server.json every second. The bridge only dials a
+        server that announced itself recently, because connecting to a port
+        nobody listens on can stall EmuHawk for seconds on Windows."""
+        while not self._stop.is_set():
+            try:
+                write_json_atomic(SERVER_INFO_FILE, {"port": self.port, "pid": os.getpid(),
+                                                     "timestamp": int(time.time())})
+            except OSError as e:
+                logger.debug(f"[SOCKET] Cannot write {SERVER_INFO_FILE}: {e}")
+            self._stop.wait(1.0)
+
+
+comm_bridge = CommBridge()
 
 
 def build_command(action: str, cmd_id: int, params: dict) -> dict:
@@ -224,59 +461,13 @@ def build_command(action: str, cmd_id: int, params: dict) -> dict:
     return {**params, "id": cmd_id, "action": action}
 
 
-def send_command_socket(action: str, cmd_id: int, params: dict) -> dict | None:
-    """Send command via socket (fast path).
-
-    Returns None only when no live bridge took the command (no socket, the
-    send failed, or the peer had closed the connection, e.g. after a Lua
-    reload), so the caller may safely retry over the file channel. A timeout
-    or a garbled reply is an error instead: the bridge may already be running
-    the command, and re-sending would run it twice (e.g. a whole input.sequence).
-    """
-    sock = get_socket_connection()
-    if sock is None:
-        return None  # Signal to use file-based
-
-    message = json.dumps(build_command(action, cmd_id, params)) + "\n"
-    try:
-        sock.sendall(message.encode('utf-8'))
-        logger.debug(f"[SOCKET] Sent: {action} (id={cmd_id})")
-    except OSError as e:
-        logger.warning(f"[SOCKET] Send failed: {e}, falling back to file-based")
-        close_socket_connection()
-        return None
-
-    try:
-        buffer = b""
-        while b"\n" not in buffer:
-            chunk = sock.recv(4096)
-            if not chunk:
-                raise ConnectionError("Connection closed")
-            buffer += chunk
-
-        response_line = buffer.split(b"\n")[0]
-        response = json.loads(response_line.decode('utf-8', errors='replace'))
-        logger.debug(f"[SOCKET] Response received for command {cmd_id}")
-        return response
-    except ConnectionError as e:
-        # Closed/reset by the peer: that bridge instance is gone (no partial
-        # reply was read, since the reply is one line), so nothing is running it.
-        logger.warning(f"[SOCKET] Connection lost ({e}), falling back to file-based")
-        close_socket_connection()
-        return None
-    except Exception as e:
-        logger.warning(f"[SOCKET] No reply for {action} (id={cmd_id}): {e}")
-        close_socket_connection()
-        return {"error": f"No reply from BizHawk for {action} after sending it ({e}). "
-                         "It may still be running; not re-sending.", "commandId": cmd_id}
-
-
-def send_command_file(action: str, cmd_id: int, params: dict, timeout: float) -> dict:
+def send_command_file(command: dict, timeout: float) -> dict:
     """Send command via file (fallback)"""
+    action, cmd_id = command["action"], command["id"]
     logger.debug(f"[FILE] Sending command: {action} (id={cmd_id})")
 
     try:
-        write_command_file(build_command(action, cmd_id, params))
+        write_json_atomic(COMMAND_FILE, command)
         logger.debug(f"[FILE] Command written to {COMMAND_FILE}")
     except Exception as e:
         logger.error(f"[FILE] Failed to write command: {e}")
@@ -329,15 +520,15 @@ def send_raw(action: str, params: dict, timeout: float | None = None) -> dict:
         logger.error(f"BizHawk not available: {message}")
         return {"error": message, "bizhawk_not_running": True}
 
-    cmd_id = get_next_id()
+    command = build_command(action, get_next_id(), params)
 
     # Try socket first (fast path)
-    result = send_command_socket(action, cmd_id, params)
+    result = comm_bridge.send(command, timeout)
     if result is not None:
         return result
 
     # Fall back to file-based
-    return send_command_file(action, cmd_id, params, timeout)
+    return send_command_file(command, timeout)
 
 
 def read_state() -> dict:
@@ -366,25 +557,27 @@ def tool_definitions() -> list[Tool]:
         # ═══════════════════════════════════════════════════════════════
         Tool(
             name="emu_debug_read_memory",
-            description="Read a byte from emulator memory. Address can be hex (0x02000000 or $02000000) or decimal. The default domain 'ARM9 System Bus' takes physical DS addresses (0x02000000 main RAM, 0x04000000 I/O, 0x05000000 palette, 0x06000000 VRAM, 0x07000000 OAM); other domains such as 'Main RAM' take offsets.",
+            description="Read a 1, 2 or 4-byte little-endian value from emulator memory. Address can be hex (0x02000000 or $02000000) or decimal. The default domain 'ARM9 System Bus' takes physical DS addresses (0x02000000 main RAM, 0x04000000 I/O, 0x05000000 palette, 0x06000000 VRAM, 0x07000000 OAM); other domains such as 'Main RAM' take offsets.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "address": {"type": "string", "description": "Memory address (hex or decimal)"},
-                    "domain": {"type": "string", "description": "Memory domain (optional, default='ARM9 System Bus')"}
+                    "domain": {"type": "string", "description": "Memory domain (optional, default='ARM9 System Bus')"},
+                    "size": SIZE_PROPERTY
                 },
                 "required": ["address"]
             }
         ),
         Tool(
             name="emu_debug_write_memory",
-            description="Write a byte to emulator RAM. Useful for modifying game values like lives, health, score in the running emulator.",
+            description="Write a 1, 2 or 4-byte little-endian value to emulator memory. Useful for modifying game values like lives, health, score in the running emulator.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "address": {"type": "string", "description": "Memory address (hex or decimal)"},
-                    "value": {"type": "integer", "description": "Value to write (0-255)"},
-                    "domain": {"type": "string", "description": "Memory domain (optional)"}
+                    "value": {"type": "integer", "description": "Value to write; must fit in size bytes (negative values are written as two's complement)"},
+                    "domain": {"type": "string", "description": "Memory domain (optional)"},
+                    "size": SIZE_PROPERTY
                 },
                 "required": ["address", "value"]
             }
@@ -404,11 +597,13 @@ def tool_definitions() -> list[Tool]:
         ),
         Tool(
             name="emu_debug_search_memory",
-            description="Search memory for bytes equal to a value. Defaults to all of main RAM (0x02000000-0x023FFFFF on ARM9 System Bus). Returns up to 1000 matching addresses; 'total' gives the full count.",
+            description="Search memory for a 1, 2 or 4-byte little-endian value. Defaults to all of main RAM (0x02000000-0x023FFFFF on ARM9 System Bus). Returns up to 1000 matching addresses; 'total' gives the full count.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "value": {"type": "integer", "description": "Value to search for (0-255)"},
+                    "value": {"type": "integer", "description": "Value to search for; must fit in size bytes (negative values match their two's complement)"},
+                    "size": SIZE_PROPERTY,
+                    "aligned": ALIGNED_PROPERTY,
                     **REGION_PROPERTIES
                 },
                 "required": ["value"]
@@ -427,12 +622,15 @@ def tool_definitions() -> list[Tool]:
         ),
         Tool(
             name="emu_debug_compare_memory",
-            description="Compare current memory to a snapshot. Filter: 'changed', 'increased', 'decreased', 'same'. Returns up to 1000 entries; 'total' gives the full count.",
+            description="Compare current memory to a snapshot, as 1, 2 or 4-byte values (any width works with any snapshot). Filter: 'changed', 'increased', 'decreased', 'same'. Returns up to 1000 entries; 'total' gives the full count.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Snapshot name to compare to"},
-                    "filter": {"type": "string", "description": "Filter type: changed/increased/decreased/same"}
+                    "filter": {"type": "string", "description": "Filter type: changed/increased/decreased/same"},
+                    "size": SIZE_PROPERTY,
+                    "signed": SIGNED_PROPERTY,
+                    "aligned": ALIGNED_PROPERTY
                 }
             }
         ),
@@ -727,7 +925,8 @@ def tool_definitions() -> list[Tool]:
                 "properties": {
                     "initialValue": {"type": "integer", "description": "Optional: known starting value to filter by"},
                     "frames": {"type": "integer", "description": "Frames to advance before comparing (default=60, max=300)"},
-                    "minDecrement": {"type": "integer", "description": "Minimum decrease amount (default=1)"}
+                    "minDecrement": {"type": "integer", "description": "Minimum decrease amount (default=1)"},
+                    "size": SIZE_PROPERTY
                 }
             }
         ),
@@ -739,7 +938,8 @@ def tool_definitions() -> list[Tool]:
                 "properties": {
                     "phase": {"type": "integer", "description": "1 = take snapshot, 2 = compare after event", "enum": [1, 2]},
                     "snapshotName": {"type": "string", "description": "Snapshot name (default='event_hunt')"},
-                    "filter": {"type": "string", "description": "For phase 2: changed/increased/decreased (default='changed')"}
+                    "filter": {"type": "string", "description": "For phase 2: changed/increased/decreased (default='changed')"},
+                    "size": SIZE_PROPERTY
                 },
                 "required": ["phase"]
             }
@@ -753,7 +953,8 @@ def tool_definitions() -> list[Tool]:
                     "addresses": {"type": "array", "items": {"type": "string"}, "description": "List of candidate addresses to check"},
                     "action": {"type": "string", "description": "snapshot = take snapshot, filter = compare", "enum": ["snapshot", "filter"]},
                     "filter": {"type": "string", "description": "For filter action: changed/unchanged/increased/decreased"},
-                    "snapshotName": {"type": "string", "description": "Snapshot name (default='narrow')"}
+                    "snapshotName": {"type": "string", "description": "Snapshot name (default='narrow')"},
+                    "size": SIZE_PROPERTY
                 },
                 "required": ["addresses", "action"]
             }
@@ -784,6 +985,148 @@ def tool_definitions() -> list[Tool]:
                     "topN": {"type": "integer", "description": "Number of hotspots to return (default=20)"}
                 }
             }
+        ),
+
+        # ═══════════════════════════════════════════════════════════════
+        # NINTENDO DS TOOLS (typed wrappers around the bridge's DS actions)
+        # ═══════════════════════════════════════════════════════════════
+        Tool(
+            name="emu_ds_screenshot",
+            description="Capture the emulator display and return it as an image you can look at (e.g. to check on-screen text). 'top'/'bottom' crop to one DS screen (needs BizHawk's vertical screen layout); scale upsizes with nearest-neighbour so pixel fonts stay sharp.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "screen": {"type": "string", "enum": ["both", "top", "bottom"], "description": "Which screen(s) to return (default 'both')"},
+                    "scale": {"type": "integer", "minimum": 1, "maximum": 4, "description": "Integer upscale factor (default 2)"},
+                    "savePath": {"type": "string", "description": "Optional .png path on the host to also keep the full-resolution, uncropped frame"}
+                }
+            }
+        ),
+        Tool(
+            name="emu_ds_press_button",
+            description="Hold one DS button for N frames, then release it (emulation runs meanwhile).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "button": {"type": "string", "enum": DS_BUTTONS},
+                    "frames": FRAMES_PROPERTY
+                },
+                "required": ["button"]
+            }
+        ),
+        Tool(
+            name="emu_ds_touch",
+            description="Touch the bottom screen at (x, y) for N frames, then release. Needs the mouse-unbinding workaround in NDS_SETUP.md, or taps land at the mouse cursor.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer", "minimum": 0, "maximum": 255},
+                    "y": {"type": "integer", "minimum": 0, "maximum": 191},
+                    "frames": FRAMES_PROPERTY
+                },
+                "required": ["x", "y"]
+            }
+        ),
+        Tool(
+            name="emu_ds_touch_release",
+            description="Release the touchscreen and clear the sticky Touch X / Touch Y holds.",
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        Tool(
+            name="emu_ds_input_sequence",
+            description="Run several input steps in one call (one round trip for a whole menu navigation). Use 'sleep' between screen transitions so the next input lands after the game settles; prefer button presses over touches for 'touch to continue' screens.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "action": {"type": "string", "enum": ["press", "touch", "wait", "sleep"],
+                                           "description": "press a button, touch (x, y), wait N emulated frames, or sleep N seconds while emulation runs (60 frames per second; wall-clock only if LuaSocket is installed in BizHawk)"},
+                                "button": {"type": "string", "enum": DS_BUTTONS, "description": "For press"},
+                                "x": {"type": "integer", "minimum": 0, "maximum": 255, "description": "For touch"},
+                                "y": {"type": "integer", "minimum": 0, "maximum": 191, "description": "For touch"},
+                                "frames": {"type": "integer", "minimum": 1, "description": "For press/touch/wait (default 8)"},
+                                "seconds": {"type": "number", "exclusiveMinimum": 0, "description": "For sleep"}
+                            },
+                            "required": ["action"]
+                        }
+                    }
+                },
+                "required": ["steps"]
+            }
+        ),
+        Tool(
+            name="emu_ds_reset",
+            description="Hard-reset (power-cycle) the emulated DS and release all buttons. Unsaved game progress is lost.",
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        Tool(
+            name="emu_ds_close_rom",
+            description="Close the loaded ROM, releasing the file so a patcher can overwrite it. Unsaved progress is lost.",
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        Tool(
+            name="emu_ds_open_rom",
+            description="Load a ROM by absolute path; pair with emu_ds_close_rom for a patch-and-reload cycle.",
+            inputSchema={
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "Absolute path to the .nds file"}},
+                "required": ["path"]
+            }
+        ),
+        Tool(
+            name="emu_ds_dump_memory",
+            description="Write raw memory bytes to a file on the host (for large regions such as VRAM or a whole RAM image); overwrites the file.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "address": {"type": "string", "description": "Start address (hex or decimal)"},
+                    "length": {"type": "integer", "minimum": 1, "description": "Number of bytes"},
+                    "path": {"type": "string", "description": "Output file path on the host"},
+                    "domain": {"type": "string", "description": "Memory domain (optional, default='ARM9 System Bus')"}
+                },
+                "required": ["address", "length", "path"]
+            }
+        ),
+        Tool(
+            name="emu_ds_read_powcnt",
+            description="Read POWCNT1: which graphics engine drives which screen (LCD swap) and which engines are enabled.",
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        Tool(
+            name="emu_ds_decode_dispcnt",
+            description="Decode an engine's DISPCNT: BG mode, BG0-3 and OBJ enables, OBJ tile mapping and boundary, display mode.",
+            inputSchema={"type": "object", "properties": {"engine": ENGINE_PROPERTY}}
+        ),
+        Tool(
+            name="emu_ds_decode_vramcnt",
+            description="Decode VRAMCNT_A..I: which VRAM banks are enabled and how each is mapped (MST / offset).",
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        Tool(
+            name="emu_ds_read_bg",
+            description="Read one text BG layer: its BGxCNT fields, map and tile base addresses, and the 32x24 tilemap entries (useful for locating text tiles).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "engine": ENGINE_PROPERTY,
+                    "index": {"type": "integer", "minimum": 0, "maximum": 3, "description": "BG layer 0-3 (default 0)"}
+                }
+            }
+        ),
+        Tool(
+            name="emu_ds_parse_oam",
+            description="List the visible sprites in an engine's OAM: position, tile, size in tiles, palette, priority, rotation flag.",
+            inputSchema={"type": "object", "properties": {"engine": ENGINE_PROPERTY}}
+        ),
+        Tool(
+            name="emu_ds_input_debug",
+            description="Dump the joypad key names and current values the core exposes (to check names such as 'Touch X').",
+            inputSchema={"type": "object", "properties": {}}
         )
     ]
 
@@ -797,8 +1140,13 @@ READ_ONLY_TOOLS = {
     "emu_debug_list_breakpoints", "emu_debug_get_breakpoint_hits",
     "emu_debug_get_last_breakpoint_hit", "emu_debug_get_trace", "emu_debug_list_watches",
     "emu_debug_get_emulator_state", "emu_cheat_list_freezes",
+    "emu_ds_read_powcnt", "emu_ds_decode_dispcnt", "emu_ds_decode_vramcnt", "emu_ds_read_bg",
+    "emu_ds_parse_oam", "emu_ds_input_debug",
 }
-DESTRUCTIVE_TOOLS = {"emu_debug_save_state", "emu_debug_load_state", "emu_debug_raw_command"}
+DESTRUCTIVE_TOOLS = {
+    "emu_debug_save_state", "emu_debug_load_state", "emu_debug_raw_command",
+    "emu_ds_reset", "emu_ds_close_rom", "emu_ds_open_rom", "emu_ds_dump_memory",
+}
 
 
 async def list_tools() -> list[Tool]:
@@ -825,14 +1173,16 @@ def run_tool(name: str, arguments: dict) -> dict:
         # MEMORY TOOLS
         # ═══════════════════════════════════════════════════════════════
         if name == "emu_debug_read_memory":
-            result = send_command("memory.read", 
+            result = send_command("memory.read",
                                  address=arguments.get("address"),
-                                 domain=arguments.get("domain"))
+                                 domain=arguments.get("domain"),
+                                 size=arguments.get("size"))
         elif name == "emu_debug_write_memory":
-            result = send_command("memory.write", 
-                                 address=arguments.get("address"), 
+            result = send_command("memory.write",
+                                 address=arguments.get("address"),
                                  value=arguments.get("value"),
-                                 domain=arguments.get("domain"))
+                                 domain=arguments.get("domain"),
+                                 size=arguments.get("size"))
         elif name == "emu_debug_read_memory_range":
             result = send_command("memory.readRange", 
                                  address=arguments.get("address"),
@@ -841,14 +1191,15 @@ def run_tool(name: str, arguments: dict) -> dict:
         elif name == "emu_debug_search_memory":
             result = send_command("memory.search",
                                  value=arguments.get("value"),
-                                 **region_args(arguments))
+                                 **pick(arguments, "domain", "start", "length", "size", "aligned"))
         elif name == "emu_debug_snapshot_memory":
             result = send_command("memory.snapshot", name=arguments.get("name", "default"),
-                                  **region_args(arguments))
+                                  **pick(arguments, "domain", "start", "length"))
         elif name == "emu_debug_compare_memory":
             result = send_command("memory.compare", 
                                  name=arguments.get("name", "default"),
-                                 filter=arguments.get("filter", "changed"))
+                                 filter=arguments.get("filter", "changed"),
+                                 **pick(arguments, "size", "signed", "aligned"))
         elif name == "emu_debug_list_memory_domains":
             result = send_command("memory.getDomains")
         
@@ -1003,7 +1354,8 @@ def run_tool(name: str, arguments: dict) -> dict:
                 # Step 3: Compare for decreased values; the bridge applies the
                 # filters before capping the list at 1000 entries.
                 compare_result = send_command("memory.compare", name="decr_hunt", filter="decreased",
-                                              minDelta=min_decrement, oldValue=initial_value)
+                                              minDelta=min_decrement, oldValue=initial_value,
+                                              size=arguments.get("size"))
                 logger.debug(f"[find_decrementing_value] Compare result: commandId={compare_result.get('commandId', 'N/A')}")
 
                 candidates = data_of(compare_result)
@@ -1046,7 +1398,8 @@ def run_tool(name: str, arguments: dict) -> dict:
                 # Phase 2: Compare after event
                 logger.debug(f"[find_value_on_event] Phase 2: Comparing with snapshot '{snapshot_name}', filter='{filter_type}'")
                 send_command("execution.pause", timeout=FAST_TIMEOUT)
-                compare_result = send_command("memory.compare", name=snapshot_name, filter=filter_type)
+                compare_result = send_command("memory.compare", name=snapshot_name, filter=filter_type,
+                                              size=arguments.get("size"))
                 send_command("execution.resume", timeout=FAST_TIMEOUT)  # Resume after comparison
                 logger.debug("[find_value_on_event] Phase 2 complete, game resumed")
                 
@@ -1078,13 +1431,14 @@ def run_tool(name: str, arguments: dict) -> dict:
                 except (ValueError, TypeError):
                     continue  # Skip invalid addresses
 
+            size = arguments.get("size") or 1
             if not addr_ints:
                 result = {"error": "No valid candidate addresses given"}
-            elif max(addr_ints) - min(addr_ints) >= 0x400000:
+            elif max(addr_ints) - min(addr_ints) + size > 0x400000:
                 result = {"error": "Candidate addresses span more than 4 MB; narrow them in batches"}
             elif action == "snapshot":
                 start = min(addr_ints)
-                span = max(addr_ints) - start + 1
+                span = max(addr_ints) - start + size
                 logger.debug(f"[narrow_candidates] Snapshot action: {len(addr_ints)} addresses, name='{snapshot_name}'")
                 send_command("execution.pause", timeout=FAST_TIMEOUT)
                 snap_result = send_command("memory.snapshot", name=snapshot_name,
@@ -1105,7 +1459,7 @@ def run_tool(name: str, arguments: dict) -> dict:
                 logger.debug(f"[narrow_candidates] Filter action: {len(addr_ints)} addresses, filter='{filter_type}'")
                 send_command("execution.pause", timeout=FAST_TIMEOUT)
                 compare_result = send_command("memory.compare", name=snapshot_name, filter=filter_type,
-                                              addresses=addr_ints)
+                                              addresses=addr_ints, size=size)
                 send_command("execution.resume", timeout=FAST_TIMEOUT)  # Resume after filtering
                 logger.debug("[narrow_candidates] Filter complete, game resumed")
 
@@ -1182,6 +1536,45 @@ def run_tool(name: str, arguments: dict) -> dict:
                                   frames=min(arguments.get("frames", 1), 60),
                                   topN=arguments.get("topN", 20))
         
+        # ═══════════════════════════════════════════════════════════════
+        # NINTENDO DS TOOLS
+        # ═══════════════════════════════════════════════════════════════
+        elif name == "emu_ds_screenshot":
+            result = take_screenshot(arguments)
+        elif name == "emu_ds_press_button":
+            result = send_command("input.press", button=arguments.get("button"),
+                                  frames=arguments.get("frames", 8))
+        elif name == "emu_ds_touch":
+            result = send_command("input.touch", x=arguments.get("x"), y=arguments.get("y"),
+                                  frames=arguments.get("frames", 8))
+        elif name == "emu_ds_touch_release":
+            result = send_command("input.touch_release")
+        elif name == "emu_ds_input_sequence":
+            result = send_command("input.sequence", seq=build_sequence(arguments.get("steps") or []))
+        elif name == "emu_ds_reset":
+            result = send_command("system.reset")
+        elif name == "emu_ds_close_rom":
+            result = send_command("system.close_rom")
+        elif name == "emu_ds_open_rom":
+            result = send_command("system.open_rom", path=arguments.get("path"))
+        elif name == "emu_ds_dump_memory":
+            result = send_command("memory.dump_to_file", address=arguments.get("address"),
+                                  length=arguments.get("length"), path=arguments.get("path"),
+                                  domain=arguments.get("domain"))
+        elif name == "emu_ds_read_powcnt":
+            result = send_command("powcnt.read")
+        elif name == "emu_ds_decode_dispcnt":
+            result = send_command("dispcnt.decode", engine=arguments.get("engine", "main"))
+        elif name == "emu_ds_decode_vramcnt":
+            result = send_command("vramcnt.decode")
+        elif name == "emu_ds_read_bg":
+            result = send_command("bg.read", engine=arguments.get("engine", "main"),
+                                  index=arguments.get("index", 0))
+        elif name == "emu_ds_parse_oam":
+            result = send_command("oam.parse", engine=arguments.get("engine", "main"))
+        elif name == "emu_ds_input_debug":
+            result = send_command("input.debug")
+
         else:
             result = {"error": f"Unknown tool: {name}"}
             logger.warning(f"Unknown tool: {name}")
@@ -1195,9 +1588,112 @@ def run_tool(name: str, arguments: dict) -> dict:
     return result
 
 
-def region_args(arguments: dict) -> dict:
-    """Optional domain/start/length for search/snapshot, omitting unset ones"""
-    return {k: arguments[k] for k in ("domain", "start", "length") if arguments.get(k) is not None}
+def pick(arguments: dict, *keys: str) -> dict:
+    """The given optional arguments that were actually set"""
+    return {k: arguments[k] for k in keys if arguments.get(k) is not None}
+
+
+class ToolOutput:
+    """A tool result plus PNG images to return as MCP image content"""
+
+    def __init__(self, result: dict, images: list[bytes]):
+        self.result = result
+        self.images = images
+
+
+def process_screenshot(png: bytes, screen: str, scale: int) -> tuple[bytes, int, int]:
+    """Crop a BizHawk NDS frame to one screen and/or upscale it (nearest
+    neighbour, so pixel fonts stay sharp). Returns (png, width, height)."""
+    if png[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("BizHawk did not write a PNG")
+    width, height = struct.unpack(">II", png[16:24])  # IHDR
+    if screen == "both" and scale == 1:
+        return png, width, height
+    try:
+        from PIL import Image
+    except ImportError:
+        raise RuntimeError("Cropping or scaling needs Pillow (pip install -r requirements.txt); "
+                           "screen='both' with scale=1 works without it") from None
+    img = Image.open(io.BytesIO(png))
+    if screen != "both":
+        # Vertical layout: the two screens stacked (maybe with a gap), each
+        # 256x192 times the core's resolution multiplier.
+        k = width // 256
+        screen_h = 192 * k
+        if k < 1 or width % 256 or height < 2 * screen_h:
+            raise ValueError(f"screen='{screen}' needs BizHawk's vertical NDS screen layout "
+                             f"(screens stacked); this frame is {width}x{height}. Use screen='both'.")
+        top = 0 if screen == "top" else height - screen_h
+        img = img.crop((0, top, width, top + screen_h))
+    if scale > 1:
+        img = img.resize((img.width * scale, img.height * scale), Image.Resampling.NEAREST)
+    out = io.BytesIO()
+    img.save(out, "PNG")
+    return out.getvalue(), img.width, img.height
+
+
+def take_screenshot(arguments: dict):
+    screen = arguments.get("screen", "both")
+    scale = arguments.get("scale", 2)
+    save_path = arguments.get("savePath")
+    if screen not in ("both", "top", "bottom"):
+        return {"error": "screen must be 'both', 'top' or 'bottom'"}
+    if scale not in (1, 2, 3, 4):
+        return {"error": "scale must be an integer 1-4"}
+    if save_path and not save_path.lower().endswith(".png"):
+        return {"error": "savePath must end in .png"}
+    path = os.path.abspath(save_path) if save_path else SCREENSHOT_FILE
+
+    def remove_temp():
+        if not save_path:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+
+    remove_temp()  # never hand back a stale frame
+    response = send_command("screenshot.take", path=path)
+    data = data_of(response)
+    if data is None:
+        return response
+    try:
+        with open(path, "rb") as f:
+            png = f.read()
+    finally:
+        remove_temp()
+    png, width, height = process_screenshot(png, screen, scale)
+    result = {"success": True, "screen": screen, "scale": scale, "width": width, "height": height,
+              "frameCount": data.get("frameCount")}
+    if save_path:
+        result["savedTo"] = path
+    return ToolOutput(result, [png])
+
+
+def build_sequence(steps: list) -> str:
+    """Typed input steps -> the bridge's flat input.sequence string"""
+    parts = []
+    for i, step in enumerate(steps):
+        kind = step.get("action")
+        frames = int(step.get("frames") or 8)
+        if kind == "press":
+            if step.get("button") not in DS_BUTTONS:
+                raise ValueError(f"step {i}: press needs a button, one of {', '.join(DS_BUTTONS)}")
+            parts.append(f"press {step['button']} {frames}")
+        elif kind == "touch":
+            x, y = step.get("x"), step.get("y")
+            if not (isinstance(x, int) and 0 <= x <= 255 and isinstance(y, int) and 0 <= y <= 191):
+                raise ValueError(f"step {i}: touch needs integer x 0-255 and y 0-191")
+            parts.append(f"touch {x} {y} {frames}")
+        elif kind == "wait":
+            parts.append(f"wait {frames}")
+        elif kind == "sleep":
+            seconds = step.get("seconds")
+            if not isinstance(seconds, (int, float)) or seconds <= 0:
+                raise ValueError(f"step {i}: sleep needs seconds > 0")
+            parts.append(f"sleep {seconds:g}")
+        else:
+            raise ValueError(f"step {i}: unknown action {kind!r}")
+    return "; ".join(parts)
 
 
 async def call_tool(name: str, arguments: dict) -> CallToolResult:
@@ -1208,9 +1704,14 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
             return run_tool(name, arguments or {})
 
     result = await asyncio.to_thread(locked)
+    images = []
+    if isinstance(result, ToolOutput):
+        result, images = result.result, result.images
     is_error = isinstance(result, dict) and ("error" in result or result.get("success") is False)
-    return CallToolResult(content=[TextContent(type="text", text=json.dumps(result, indent=2))],
-                          isError=is_error)
+    content = [ImageContent(type="image", data=base64.b64encode(png).decode("ascii"), mimeType="image/png")
+               for png in images]
+    content.append(TextContent(type="text", text=json.dumps(result, indent=2)))
+    return CallToolResult(content=content, isError=is_error)
 
 
 class ToolCallError(Exception):
@@ -1226,7 +1727,7 @@ def create_server() -> Server:
         async def v1_call_tool(name: str, arguments: dict) -> list[TextContent]:
             result = await call_tool(name, arguments)
             if result.isError:
-                raise ToolCallError(result.content[0].text)  # reported with isError=True
+                raise ToolCallError(result.content[-1].text)  # reported with isError=True
             return result.content
 
         srv.list_tools()(list_tools)
@@ -1249,6 +1750,7 @@ logger.info("BizHawk MCP Server instance created")
 async def main():
     """Run the MCP server"""
     logger.info("Starting BizHawk MCP server main loop")
+    comm_bridge.start()
     try:
         async with stdio_server() as (read_stream, write_stream):
             logger.info("stdio_server started, running server...")
@@ -1256,6 +1758,8 @@ async def main():
     except Exception as e:
         logger.error(f"Server error: {e}", exc_info=True)
         raise
+    finally:
+        comm_bridge.stop()
 
 
 if __name__ == "__main__":
@@ -1270,7 +1774,8 @@ if __name__ == "__main__":
     print_err(f"Log file: {LOG_FILE}")
     print_err("")
     print_err("Setup:")
-    print_err("   1. Open BizHawk and load a ROM")
+    print_err("   1. Open BizHawk and load a ROM (optionally start EmuHawk with")
+    print_err(f"      --socket_ip=127.0.0.1 --socket_port={SOCKET_PORT} for the socket fast path)")
     print_err("   2. Tools > Lua Console")
     print_err("   3. Load bizhawk_debug_api.lua")
     print_err("=" * 60)
