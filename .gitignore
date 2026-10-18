@@ -1,8 +1,9 @@
 # BizHawk debug IPC state (runtime, regenerated each session)
 src/debug_commands.json
+src/debug_commands.json.tmp
 src/debug_response.json
 src/debug_state.json
-src/bizhawk_mcp.log
+src/bizhawk_mcp.log*
 
 # Screenshots / scratch outputs from MCP sessions
 dumps/
@@ -15,3 +16,4 @@ render_tiles.py
 # Python cache
 __pycache__/
 *.pyc
+.pytest_cache/
