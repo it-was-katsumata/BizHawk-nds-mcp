@@ -18,7 +18,7 @@ substitute your own. `<repo>` is wherever you cloned this repository.
 <venv>\Scripts\pip.exe install -r <repo>\requirements.txt
 ```
 
-The only required dep is the `mcp` Python SDK (1.30+ or 2.x; the server supports both). If you see `ModuleNotFoundError: No module named 'mcp'` when the client tries to launch the server, this step was skipped. Confirm with:
+The deps are the `mcp` Python SDK (1.30+ or 2.x; the server supports both) and Pillow (used by `emu_ds_screenshot` to crop and scale). If you see `ModuleNotFoundError: No module named 'mcp'` when the client tries to launch the server, this step was skipped. Confirm with:
 
 ```powershell
 <venv>\Scripts\python.exe <repo>\src\bizhawk_mcp_server.py
@@ -95,7 +95,28 @@ To share it with a project instead, commit a `.mcp.json` at the project root:
 ```
 
 Start a new session (or run `/mcp` to check the connection). Tools prefixed
-`mcp__bizhawk__emu_debug_*` should be available.
+`mcp__bizhawk__emu_debug_*` and `mcp__bizhawk__emu_ds_*` should be available.
+
+### Step 6 — Socket fast path (optional)
+
+By default commands go through JSON files polled every 50 ms. For about one
+frame per command instead, let the bridge use BizHawk's built-in socket client:
+
+1. Start your MCP client first, so the server is listening on `127.0.0.1:9876`
+   (change it with the `BIZHAWK_MCP_PORT` environment variable on the server).
+2. Then start EmuHawk with the socket flags, e.g. a shortcut or batch file:
+   ```powershell
+   EmuHawk.exe --socket_ip=127.0.0.1 --socket_port=9876 "<your-rom>.nds"
+   ```
+3. Load the Lua bridge as usual. The console prints
+   `Socket Mode: ENABLED` and then `[SOCKET] Connected to the MCP server`.
+
+EmuHawk opens the connection during startup and **shows a fatal error if nothing
+is listening**, so only use the flags while the MCP server runs; otherwise start
+EmuHawk normally (file IPC works as before). If the MCP server restarts (for
+example a new Claude session), the bridge finds the new one through
+`src/debug_server.json` and reconnects within a few seconds, using the files in
+the meantime.
 
 ## Smoke test
 
@@ -107,19 +128,20 @@ mcp__bizhawk__emu_debug_get_emulator_state()
 
 Should return current frame count + system id + CPU registers. If this works, we're connected end-to-end.
 
-Then try the NDS-specific actions via `emu_debug_raw_command`:
+Then try the DS tools:
 
 ```
-emu_debug_raw_command(action="powcnt.read")
+emu_ds_screenshot()                 # comes back as an image
+emu_ds_read_powcnt()
 # → { powcnt1: 0x820F, lcd_swap: true, engine_a_screen: "top", ... }
 
-emu_debug_raw_command(action="oam.parse", params={"engine": "sub"})
+emu_ds_parse_oam(engine="sub")
 # → { sprites: [{idx: 0, y: 8, x: 4, tile: 0, w_tiles: 4, h_tiles: 4, ...}, ...] }
-
-emu_debug_raw_command(action="screenshot.take", params={"path": "C:/tmp/shot.png"})
 ```
 
-## NDS-specific actions added by this fork
+## Bridge actions (what the `emu_ds_*` tools wrap)
+
+All of these can also be sent directly with `emu_debug_raw_command(action=..., params={...})`.
 
 | action | params | returns |
 |---|---|---|
@@ -127,10 +149,10 @@ emu_debug_raw_command(action="screenshot.take", params={"path": "C:/tmp/shot.png
 | `input.touch` | `x, y, frames=8` | touches at (x, y) for N frames + releases. **Requires the mouse-rebind workaround documented in Troubleshooting** — without it, mouse XOR forces the tap to land at cursor position regardless of (x, y). |
 | `input.touch_release` | — | releases Touch and clears the analog autoholds |
 | `input.press` | `button="A", frames=8` | press one button for N frames then release. |
-| `input.sequence` | `seq="press A; sleep 6; press A; sleep 2.5; press A; sleep 8; press Right; sleep 0.4; press Down; sleep 0.4; press A; sleep 1"` | runs several input steps in ONE command (one round trip for a whole navigation sequence instead of one per button). `seq` is a flat string: steps split by `;`, fields by spaces. Step forms: `press <BTN> [frames]`, `touch <x> <y> [frames]`, `wait <frames>` (emulated frames, default 8), `sleep <seconds>` (wall-clock real time, advances frames meanwhile). Use `sleep` between screen transitions so the next input lands after the game has settled. Prefer `press A`/`press B` over `touch` for "touch to continue" / menu screens — a `touch` lands at fixed coords and can hit the wrong button. The socket and file timeouts are 30s (see `SOCKET_TIMEOUT` / `DEFAULT_TIMEOUT`), so a full ~20s boot-to-screen batch fits in one command. The example above is an illustrative boot-to-in-game navigation (skip the boot splash, pick a menu entry, then move the cursor and confirm). |
+| `input.sequence` | `seq="press A; sleep 6; press A; sleep 2.5; press A; sleep 8; press Right; sleep 0.4; press Down; sleep 0.4; press A; sleep 1"` | runs several input steps in ONE command (one round trip for a whole navigation sequence instead of one per button). `seq` is a flat string: steps split by `;`, fields by spaces. Step forms: `press <BTN> [frames]`, `touch <x> <y> [frames]`, `wait <frames>` (emulated frames, default 8), `sleep <seconds>` (advances frames meanwhile: 60 frames per second, or wall-clock time if LuaSocket is installed in BizHawk). Use `sleep` between screen transitions so the next input lands after the game has settled. Prefer `press A`/`press B` over `touch` for "touch to continue" / menu screens — a `touch` lands at fixed coords and can hit the wrong button. Commands time out after 30s (`DEFAULT_TIMEOUT`), so a full ~20s boot-to-screen batch fits in one command. `emu_ds_input_sequence` builds this string from a typed list of steps. The example above is an illustrative boot-to-in-game navigation (skip the boot splash, pick a menu entry, then move the cursor and confirm). |
 | `input.debug` | — | returns the full `joypad.get()` / `joypad.get(1)` / `joypad.getimmediate(1)` maps so you can discover which key names the current core exposes. Critical for NDS where touch keys are `Touch X` / `Touch Y` with a literal space, not `TouchX` / `TouchY`. |
 | `frame.advance` | `frames=1` | advances N frames (works while paused; stays paused) |
-| `screenshot.take` | `path` | saves screen to PNG file |
+| `screenshot.take` | `path` | saves the display to a PNG file (`emu_ds_screenshot` uses this, then returns the image) |
 | `memory.dump_to_file` | `address, length, path, domain?` | writes raw bytes to a file (for large regions such as VRAM or a whole RAM image) |
 | `trace.hotspots` | `frames=1, topN=20` | counts executed ARM9 instruction addresses over N frames (≤60; very slow while running, JIT must be off) |
 | `system.reset` | — | hard reset / power cycle. Unpauses + clears all button autoholds. |
@@ -186,8 +208,20 @@ NDS sync settings and reload the ROM.
 - Start a new session after adding the server.
 - Check the Python server runs standalone: `python <repo>\src\bizhawk_mcp_server.py` — should print `BizHawk MCP Server starting...`.
 
-**`screenshot.take` returns "screenshot failed"**
-Ensure the output directory exists. BizHawk won't create it.
+**`screenshot.take` / `emu_ds_screenshot` returns "screenshot failed"**
+Check the path is writable. (BizHawk 2.11.1 creates missing folders itself.)
+
+**`emu_ds_screenshot` with `screen="top"`/`"bottom"` says it needs the vertical layout**
+Cropping assumes both screens stacked vertically (BizHawk's default NDS screen
+layout). With a horizontal, rotated or single-screen layout, use `screen="both"`.
+
+**EmuHawk shows a fatal error at startup after adding `--socket_ip`/`--socket_port`**
+Nothing was listening on that port: EmuHawk connects during startup. Start the
+MCP client (and so the server) first, or start EmuHawk without the flags.
+
+**Lua Console shows `[SOCKET] … using file IPC until the MCP server is back`**
+The connection dropped (usually the MCP server stopped). Commands keep working
+through the files; the bridge reconnects by itself once a server is running.
 
 **Touch coords land at the wrong spot (always top-right corner or wherever the mouse cursor is)**
 

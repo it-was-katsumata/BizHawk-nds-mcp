@@ -64,6 +64,7 @@ local STATE_FILE = BASE_PATH .. "debug_state.json"
 local COMMAND_FILE = BASE_PATH .. "debug_commands.json"
 local RESPONSE_FILE = BASE_PATH .. "debug_response.json"
 local TRACE_FILE = BASE_PATH .. "debug_trace.json"
+local SERVER_INFO_FILE = BASE_PATH .. "debug_server.json"  -- written by the MCP server
 
 -- NDS main RAM is 4 MB (0x02000000..0x023FFFFF). Memory.search and
 -- Memory.snapshot sweep all of it by default on ARM9 System Bus, so the
@@ -80,60 +81,46 @@ local MAX_RANGE = 0x10000          -- cap on memory.readRange length
 local DEFAULT_SYSTEM_DOMAIN = "ARM9 System Bus"
 
 -- ═══════════════════════════════════════════════════════════════
--- SOCKET CONFIGURATION (LuaSocket - Fast Communication)
+-- SOCKET CONFIGURATION (BizHawk's built-in comm.socketServer* client)
 -- ═══════════════════════════════════════════════════════════════
+--
+-- EmuHawk's Lua can only open an OUTBOUND socket, so the Python MCP server
+-- listens and this script is the client. The client object exists only when
+-- EmuHawk was started with --socket_ip=127.0.0.1 --socket_port=9876, and
+-- EmuHawk connects during startup (it shows a fatal error if nothing is
+-- listening yet), so start the MCP server first. Without the flags
+-- everything goes through the JSON files, as before.
+--
+-- Protocol (BizHawk 2.6.2+ frames each message as "<byte length> <payload>"):
+-- every loop iteration this script sends READY or "RESULT <json>", and the
+-- server answers each message at once with NONE or a command. The answer
+-- is read at the start of the NEXT iteration, by which time it is already
+-- buffered, so receiving does not stall emulation.
+--
+-- BizHawk 2.11.1 quirks this relies on (SocketServer.cs):
+--   - socketServerIsConnected() only reports that a connect once succeeded,
+--     so a dead peer is detected from a failed send or a missing answer.
+--   - Every (re)connect makes a new socket with an infinite receive
+--     timeout, so the timeout is set again after each connect.
+--   - ReceiveString spins forever if a read returns end-of-stream while it
+--     reads a length prefix. The Python side therefore always aborts with
+--     RST (SO_LINGER 0), so the first read after a reset fails cleanly. But
+--     later reads on a reset socket can return end-of-stream (Linux), so
+--     this script never calls socketServerResponse twice without a
+--     successful send in between: a send on a dead connection fails, and
+--     the connection is then dropped before anything reads from it again.
 
-local SOCKET_PORT = 9876
-local SOCKET_ENABLED = true  -- Try socket first, fallback to file
-local socketServer = nil
-local socketClient = nil
-local socketInitialized = false
+local SOCKET_RECEIVE_TIMEOUT_MS = 50     -- only waited for when an answer is missing
+local SOCKET_MAX_MISSES = 3              -- missing answers in a row before giving up
+local SOCKET_RECHECK_SECONDS = 2         -- how often to look for a (new) MCP server
+local SOCKET_RETRY_AFTER_FAIL = 10       -- back-off after a failed connect
+local SERVER_INFO_MAX_AGE = 5            -- seconds; the server refreshes it every second
 
--- Try to load LuaSocket
-local socket = nil
-local socketOk, socketErr = pcall(function()
-    socket = require("socket")
-end)
-
-if socketOk and socket then
-    console.log("[SOCKET] LuaSocket loaded successfully — using TCP")
-else
-    -- File-IPC fallback is the supported path for this NDS fork.  The
-    -- upstream q8fft2 repo ships a lua/socket.lua but BizHawk's Lua
-    -- engine doesn't pick it up reliably across versions, and file IPC
-    -- works fine for our use case (sub-second latency, no port to
-    -- configure).  Silencing the long error trace to reduce noise.
-    console.log("[SOCKET] LuaSocket not available — using file IPC (fine, no action needed)")
-    SOCKET_ENABLED = false
-end
-
-
--- Initialize TCP server using LuaSocket
-local function initSocketServer()
-    if not SOCKET_ENABLED or not socket then return false end
-    
-    local ok, err = pcall(function()
-        socketServer = socket.tcp()
-        socketServer:setoption("reuseaddr", true)
-        local bindOk, bindErr = socketServer:bind("127.0.0.1", SOCKET_PORT)
-        if not bindOk then
-            error("Bind failed: " .. tostring(bindErr))
-        end
-        socketServer:listen(1)
-        socketServer:settimeout(0)  -- Non-blocking!
-        socketInitialized = true
-    end)
-    
-    if ok then
-        console.log("[SOCKET] TCP Server listening on port " .. SOCKET_PORT)
-        return true
-    else
-        console.log("[SOCKET] Server init failed: " .. tostring(err))
-        SOCKET_ENABLED = false
-        return false
-    end
-end
-
+-- Optional LuaSocket, used only for sub-second wall-clock time in the
+-- input.sequence `sleep` step. BizHawk doesn't bundle it; without it,
+-- `sleep` counts 60 frames per second.
+local luasocket = nil
+pcall(function() luasocket = require("socket") end)
 
 
 
@@ -465,27 +452,55 @@ local function readBlock(addr, length, domain)
     return table.concat(parts)
 end
 
-function Memory.read(addr, domain)
-    addr = parseAddress(addr)
-    if addr == nil then
-        return { error = "Invalid address" }
+-- Multi-byte values are little-endian, 1, 2 or 4 bytes wide. Negative
+-- values are encoded as two's complement (-1 with size 2 is 0xFFFF).
+local function checkSize(size)
+    size = size or 1
+    if size ~= 1 and size ~= 2 and size ~= 4 then
+        return nil, "Invalid size: must be 1, 2 or 4"
     end
-    local d, err = resolveDomain(domain)
-    if not d then return { error = err } end
-    return memory.readbyte(addr, d)
+    return size
 end
 
-function Memory.write(addr, value, domain)
+local function packValue(value, size)
+    if math.type(value) ~= "integer" then return nil, "Invalid value: must be an integer" end
+    local limit = 1 << (8 * size)
+    if value < -(limit >> 1) or value >= limit then
+        return nil, "Invalid value: out of range for " .. size .. " byte(s)"
+    end
+    return string.pack("<I" .. size, value & (limit - 1))
+end
+
+function Memory.read(addr, domain, size)
     addr = parseAddress(addr)
     if addr == nil then
         return { error = "Invalid address" }
     end
-    if math.type(value) ~= "integer" or value < 0 or value > 255 then
-        return { error = "Invalid value: must be an integer 0-255" }
-    end
-    local d, err = resolveDomain(domain)
+    local err
+    size, err = checkSize(size)
+    if not size then return { error = err } end
+    local d
+    d, err = resolveDomain(domain)
     if not d then return { error = err } end
-    memory.writebyte(addr, value, d)
+    if size == 1 then return memory.readbyte(addr, d) end
+    return (string.unpack("<I" .. size, readBlock(addr, size, d)))
+end
+
+function Memory.write(addr, value, domain, size)
+    addr = parseAddress(addr)
+    if addr == nil then
+        return { error = "Invalid address" }
+    end
+    local err, bytes, d
+    size, err = checkSize(size)
+    if not size then return { error = err } end
+    bytes, err = packValue(value, size)
+    if not bytes then return { error = err } end
+    d, err = resolveDomain(domain)
+    if not d then return { error = err } end
+    for k = 1, size do
+        memory.writebyte(addr + k - 1, bytes:byte(k), d)
+    end
     return { written = true }
 end
 
@@ -527,21 +542,30 @@ local function resolveRegion(opts)
     return { domain = d, start = start, length = length }
 end
 
+-- opts: region fields plus size (1/2/4) and aligned (size > 1 only;
+-- default true, since DS code keeps 16/32-bit values aligned).
 function Memory.search(value, opts)
-    if math.type(value) ~= "integer" or value < 0 or value > 255 then
-        return { error = "Invalid value: must be an integer 0-255" }
-    end
-    local region, err = resolveRegion(opts)
+    opts = opts or {}
+    local size, err = checkSize(opts.size)
+    if not size then return { error = err } end
+    local needle
+    needle, err = packValue(value, size)
+    if not needle then return { error = err } end
+    local region
+    region, err = resolveRegion(opts)
     if not region then return { error = err } end
     local block = readBlock(region.start, region.length, region.domain)
+    local aligned = size > 1 and opts.aligned ~= false
+    local unsigned = string.unpack("<I" .. size, needle)
     local results, total = {}, 0
-    local needle = string.char(value)
     local i = block:find(needle, 1, true)
     while i do
-        total = total + 1
-        if total <= MAX_RESULTS then
-            local addr = region.start + i - 1
-            results[total] = { address = addr, hex = hexAddr(addr), value = value }
+        local addr = region.start + i - 1
+        if not aligned or addr % size == 0 then
+            total = total + 1
+            if total <= MAX_RESULTS then
+                results[total] = { address = addr, hex = hexAddr(addr), value = unsigned }
+            end
         end
         i = block:find(needle, i + 1, true)
     end
@@ -558,8 +582,11 @@ function Memory.snapshot(name, opts)
              start = hexAddr(region.start) }
 end
 
--- opts: addresses (only compare these), oldValue (keep entries whose old
--- byte equals it), minDelta (keep entries with |diff| >= it).
+-- Snapshots are raw bytes, so one snapshot can be compared at any width.
+-- opts: size (1/2/4), signed (compare as signed numbers), aligned (size > 1;
+-- default true), addresses (only compare values starting at these),
+-- oldValue (keep entries whose old value equals it), minDelta (keep
+-- entries with |diff| >= it).
 -- Returns (changes capped at MAX_RESULTS, total matches).
 function Memory.compare(name, filter, opts)
     name = name or "default"
@@ -572,13 +599,25 @@ function Memory.compare(name, filter, opts)
         and filter ~= "same" and filter ~= "unchanged" then
         return { error = "Invalid filter: use changed/increased/decreased/same" }
     end
+    local size, err = checkSize(opts.size)
+    if not size then return { error = err } end
 
     local current = readBlock(snapshot.start, snapshot.length, snapshot.domain)
     local old = snapshot.data
     local changes, total = {}, 0
+    local fmt = (opts.signed and "<i" or "<I") .. size
+    local step = (size > 1 and opts.aligned ~= false) and size or 1
+    local last = snapshot.length - size + 1  -- last offset where a whole value fits
+
+    -- First 1-based offset >= i whose address is a multiple of `step`
+    local function alignUp(i)
+        local r = (snapshot.start + i - 1) % step
+        return r == 0 and i or i + step - r
+    end
 
     local function consider(i)
-        local o, c = old:byte(i), current:byte(i)
+        local o = string.unpack(fmt, old, i)
+        local c = string.unpack(fmt, current, i)
         local diff = c - o
         local include
         if filter == "changed" then include = (diff ~= 0)
@@ -601,17 +640,25 @@ function Memory.compare(name, filter, opts)
         for _, a in ipairs(opts.addresses) do
             local addr = parseAddress(a)
             local i = addr and (addr - snapshot.start + 1)
-            if i and i >= 1 and i <= snapshot.length then consider(i) end
+            if i and i >= 1 and i <= last then consider(i) end
         end
     elseif filter == "same" or filter == "unchanged" then
-        for i = 1, snapshot.length do consider(i) end
+        for i = alignUp(1), last, step do consider(i) end
     else
-        -- Skip identical 4 KB pages wholesale; only diff pages that changed.
+        -- Skip identical 4 KB pages wholesale; only diff values that have
+        -- a byte in a page that changed (including values straddling in
+        -- from the previous page).
         local PAGE = 4096
+        local nextI = alignUp(1)  -- offsets below this were already considered
         for p = 1, snapshot.length, PAGE do
             local q = math.min(p + PAGE - 1, snapshot.length)
             if old:sub(p, q) ~= current:sub(p, q) then
-                for i = p, q do consider(i) end
+                local i = math.max(nextI, alignUp(math.max(1, p - size + 1)))
+                while i <= q and i <= last do
+                    consider(i)
+                    i = i + step
+                end
+                nextI = i
             end
         end
     end
@@ -1141,14 +1188,15 @@ local function dispatchCommand(cmd)
 
     local action = cmd.action
     local response = { success = true, action = action }
-    local region = { domain = cmd.domain, start = cmd.start, length = cmd.length }
+    local region = { domain = cmd.domain, start = cmd.start, length = cmd.length,
+                     size = cmd.size, aligned = cmd.aligned }
 
     -- Memory commands
     if action == "memory.read" then
-        response.data = Memory.read(cmd.address, cmd.domain)
+        response.data = Memory.read(cmd.address, cmd.domain, cmd.size)
 
     elseif action == "memory.write" then
-        response.data = Memory.write(cmd.address, cmd.value, cmd.domain)
+        response.data = Memory.write(cmd.address, cmd.value, cmd.domain, cmd.size)
 
     elseif action == "memory.readRange" then
         response.data = Memory.readRange(cmd.address, cmd.length, cmd.domain)
@@ -1161,7 +1209,8 @@ local function dispatchCommand(cmd)
 
     elseif action == "memory.compare" then
         response.data, response.total = Memory.compare(cmd.name, cmd.filter, {
-            addresses = cmd.addresses, oldValue = cmd.oldValue, minDelta = cmd.minDelta })
+            addresses = cmd.addresses, oldValue = cmd.oldValue, minDelta = cmd.minDelta,
+            size = cmd.size, signed = cmd.signed, aligned = cmd.aligned })
 
     elseif action == "memory.getDomains" then
         response.data = Memory.getDomains()
@@ -1443,7 +1492,7 @@ local function dispatchCommand(cmd)
         --   press <BTN> [frames]      e.g. "press A 8"
         --   touch <x> <y> [frames]    e.g. "touch 128 96 8"
         --   wait <frames>             e.g. "wait 8"   (emulated frames)
-        --   sleep <seconds>           e.g. "sleep 1.5" (wall-clock real time)
+        --   sleep <seconds>           e.g. "sleep 1.5" (60 frames/s; wall-clock with LuaSocket)
         -- Example: seq = "press A; press Right; press Down; press A; touch 128 96"
         -- (omitted frame counts default to 8, matching input.press / input.touch).
         local seq = cmd.seq or ""
@@ -1497,9 +1546,9 @@ local function dispatchCommand(cmd)
                 -- during the wait. Faster-than-native speed just advances more
                 -- frames in the same real time (harmless on a settled screen).
                 local secs = tonumber(tok[2]) or 1
-                if socket and socket.gettime then
-                    local deadline = socket.gettime() + secs
-                    while socket.gettime() < deadline do
+                if luasocket and luasocket.gettime then
+                    local deadline = luasocket.gettime() + secs
+                    while luasocket.gettime() < deadline do
                         emu.frameadvance()
                     end
                 else
@@ -1637,8 +1686,10 @@ local function dispatchCommand(cmd)
             response.data = { error = "screenshot.take requires `path`" }
             return response
         end
+        -- EmuHawk saves synchronously (PNG unless the path ends in .jpg) and
+        -- creates missing directories.
         local ok, err = pcall(function() client.screenshot(path) end)
-        response.data = ok and { saved = true, path = path }
+        response.data = ok and { saved = true, path = path, frameCount = emu.framecount() }
                             or  { error = "screenshot failed: " .. tostring(err) }
 
     elseif action == "powcnt.read" then
@@ -1867,67 +1918,121 @@ end
 -- COMMAND CHECK (Socket + File-based)
 -- ═══════════════════════════════════════════════════════════════
 
--- Check for socket commands using LuaSocket (fast path)
-local function checkSocketCommands()
-    if not SOCKET_ENABLED or not socketInitialized then return false end
-
-    -- If a new client connects while we still hold one, the old one is dead
-    -- (the MCP server connects once per run, so a fresh connection means it
-    -- restarted). Swap to the new client and drop the stale one. Otherwise a
-    -- half-open old socket (which never reports "closed") silently swallows
-    -- every future command and hangs the bridge until a Lua reload.
-    if socketClient then
-        local newClient = socketServer:accept()
-        if newClient then
-            pcall(function() socketClient:close() end)
-            newClient:settimeout(0)
-            socketClient = newClient
-            console.log("[SOCKET] New client replaced a stale connection")
-        end
+-- Run one command. pcall so a single command's runtime error doesn't kill
+-- the bridge (and the main loop) and leave BizHawk stale.
+local function runCommand(cmd, channel)
+    lastCommandId = cmd.id
+    log("[" .. channel .. "] Command: " .. tostring(cmd.action) .. " (id=" .. tostring(cmd.id) .. ")")
+    local ok, response = pcall(processCommand, cmd)
+    if not ok then
+        console.log("[" .. channel .. "] Command error: " .. tostring(response))
+        response = { success = false, error = tostring(response) }
     end
+    response.commandId = cmd.id
+    return response
+end
 
-    -- Accept new connection if no current client
-    if not socketClient then
-        local client, err = socketServer:accept()
-        if client then
-            client:settimeout(0)  -- Non-blocking
-            socketClient = client
-            console.log("[SOCKET] Client connected!")
-        end
+-- Socket state (see SOCKET CONFIGURATION at the top)
+local Sock = {
+    available = false,  -- EmuHawk was started with --socket_ip/--socket_port
+    active = false,     -- exchanging messages with an MCP server right now
+    awaiting = false,   -- an answer to our last message is due
+    misses = 0,         -- answers missed in a row
+    pending = nil,      -- response to deliver with the next message
+    nextCheck = 0,      -- os.time() at which to look for a server again
+}
+
+local function sockSend(msg)
+    local ok, n = pcall(comm.socketServerSend, msg)
+    return ok and type(n) == "number" and n > 0
+end
+
+-- Start the READY/answer exchange on the current connection.
+local function sockStart()
+    Sock.misses = 0
+    Sock.pending = nil
+    -- Without a receive timeout, one unanswered READY would freeze EmuHawk.
+    if not pcall(comm.socketServerSetTimeout, SOCKET_RECEIVE_TIMEOUT_MS) then
+        Sock.active = false
+        Sock.awaiting = false
+        return
+    end
+    Sock.active = sockSend("READY")
+    Sock.awaiting = Sock.active
+    if Sock.active then console.log("[SOCKET] Connected to the MCP server") end
+end
+
+local function sockDrop(why)
+    Sock.active = false
+    Sock.awaiting = false
+    console.log("[SOCKET] " .. why .. "; using file IPC until the MCP server is back")
+end
+
+-- (Re)connect, but only to a server that announced itself recently in
+-- debug_server.json: on Windows a connect to a port nobody listens on can
+-- block EmuHawk for a couple of seconds.
+local function sockReconnect()
+    local now = os.time()
+    if now < Sock.nextCheck then return end
+    Sock.nextCheck = now + SOCKET_RECHECK_SECONDS
+    local info = parseJson(readFile(SERVER_INFO_FILE) or "")
+    if type(info) ~= "table" or math.type(info.port) ~= "integer"
+        or now - (tonumber(info.timestamp) or 0) > SERVER_INFO_MAX_AGE then
+        return
+    end
+    -- Setting the port makes BizHawk open a new connection.
+    if pcall(comm.socketServerSetPort, info.port) then sockStart() end
+    if not Sock.active then Sock.nextCheck = now + SOCKET_RETRY_AFTER_FAIL end
+end
+
+-- Socket fast path. Returns true if a command was run.
+local function checkSocketCommands()
+    if not Sock.available then return false end
+    if not Sock.active then
+        sockReconnect()
         return false
     end
 
-    -- Try to receive data from client
-    local data, err = socketClient:receive("*l")  -- Read line
-    if data then
-        local cmd = parseJson(data)
-        if cmd and cmd.id then
-            lastCommandId = cmd.id
-            log("[SOCKET] Command: " .. tostring(cmd.action) .. " (id=" .. tostring(cmd.id) .. ")")
-
-            -- pcall so a single command's runtime error doesn't kill the
-            -- bridge (and the main loop) and leave BizHawk stale.
-            local ok, response = pcall(processCommand, cmd)
-            if not ok then
-                console.log("[SOCKET] Command error: " .. tostring(response))
-                response = { success = false, error = tostring(response) }
+    local handled = false
+    if Sock.awaiting then
+        local ok, msg = pcall(comm.socketServerResponse)
+        if not ok or type(msg) ~= "string" or msg == "" then
+            -- No answer (timeout or a dead connection). Don't read again
+            -- yet: the READY sent below doubles as a probe (it fails on a
+            -- dead connection). If the answer was merely late, answers now
+            -- run one behind, which the server handles.
+            Sock.misses = Sock.misses + 1
+            if Sock.misses >= SOCKET_MAX_MISSES then
+                sockDrop("MCP server stopped answering")
+                return false
             end
-            response.commandId = cmd.id
-            
-            -- Send response back via socket
-            local jsonResponse = toJson(response) .. "\n"
-            socketClient:send(jsonResponse)
-            log("[SOCKET] Response sent for command " .. tostring(cmd.id))
-            return true
+            msg = "NONE"
+        else
+            Sock.misses = 0
         end
-    elseif err == "closed" then
-        console.log("[SOCKET] Client disconnected")
-        socketClient:close()
-        socketClient = nil
+        Sock.awaiting = false
+        if msg ~= "NONE" then
+            local cmd = parseJson(msg)
+            if type(cmd) ~= "table" or not cmd.id then
+                -- A garbled frame means the stream is out of step; a new
+                -- connection starts clean.
+                sockDrop("Unreadable message from the MCP server")
+                Sock.nextCheck = 0
+                return false
+            end
+            Sock.pending = runCommand(cmd, "SOCKET")
+            handled = true
+        end
     end
-    -- "timeout" is normal for non-blocking, just means no data
-    
-    return false
+
+    local out = Sock.pending and ("RESULT " .. toJson(Sock.pending)) or "READY"
+    if sockSend(out) then
+        Sock.pending = nil
+        Sock.awaiting = true
+    else
+        sockDrop("Lost the connection to the MCP server")
+    end
+    return handled
 end
 
 
@@ -1947,17 +2052,7 @@ local function checkFileCommands()
     if cmd.id == lastFileCommandId then return end
     lastFileCommandId = cmd.id
 
-    lastCommandId = cmd.id
-    log("[FILE] Processing command: " .. tostring(cmd.action) .. " (id=" .. tostring(cmd.id) .. ")")
-
-    -- pcall so a single command's runtime error doesn't kill the bridge.
-    local ok, response = pcall(processCommand, cmd)
-    if not ok then
-        console.log("[FILE] Command error: " .. tostring(response))
-        response = { success = false, error = tostring(response) }
-    end
-    response.commandId = cmd.id
-
+    local response = runCommand(cmd, "FILE")
     writeFile(RESPONSE_FILE, toJson(response))
     log("[FILE] Response written for command " .. tostring(cmd.id))
 end
@@ -1989,12 +2084,18 @@ console.log("  State: " .. STATE_FILE)
 console.log("  Commands: " .. COMMAND_FILE)
 console.log("")
 
--- Initialize socket server
-if SOCKET_ENABLED then
-    console.log("Socket Mode: ENABLED (TCP server on port " .. SOCKET_PORT .. ")")
-    initSocketServer()
-else
-    console.log("Socket Mode: DISABLED (file-based only)")
+-- Socket fast path: only if EmuHawk was started with the socket flags
+-- (socketServerGetInfo returns "" otherwise).
+do
+    local ok, info = false, nil
+    if comm and comm.socketServerGetInfo then ok, info = pcall(comm.socketServerGetInfo) end
+    Sock.available = ok and type(info) == "string" and info ~= ""
+    if Sock.available then
+        console.log("Socket Mode: ENABLED (BizHawk comm client -> " .. info .. ")")
+        sockStart()
+    else
+        console.log("Socket Mode: OFF (start EmuHawk with --socket_ip=127.0.0.1 --socket_port=9876 to enable); using file IPC")
+    end
 end
 console.log("")
 

@@ -11,9 +11,9 @@ VRAMCNT, and BG tilemaps.
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 > ⚠️ **Scope**: tools act on the running emulator. A few also touch host files:
-> `emu_debug_save_state` writes savestates, and `raw_command` actions such as
-> `screenshot.take`, `memory.dump_to_file` and `system.open_rom` read or write
-> paths you give them. Every tool carries MCP `readOnlyHint` / `destructiveHint`
+> `emu_debug_save_state` writes savestates, `emu_ds_dump_memory` and
+> `emu_ds_screenshot`'s `savePath` write files, and `emu_ds_open_rom` loads a ROM
+> from disk. Every tool carries MCP `readOnlyHint` / `destructiveHint`
 > annotations so clients can tell them apart.
 
 ---
@@ -22,16 +22,17 @@ VRAMCNT, and BG tilemaps.
 
 | Feature | Description |
 |---------|-------------|
-| 🧠 **Memory Access** | Read/write/search/snapshot/compare by physical DS address via `ARM9 System Bus` (default), or by offset in MelonDS domains (`Main RAM`, `Shared WRAM`, `Instruction TCM`, `Data TCM`, …). Search/snapshot sweep all 4 MB of main RAM |
+| 🧠 **Memory Access** | Read/write/search/snapshot/compare 8, 16 or 32-bit values by physical DS address via `ARM9 System Bus` (default), or by offset in MelonDS domains (`Main RAM`, `Shared WRAM`, `Instruction TCM`, `Data TCM`, …). Search/snapshot sweep all 4 MB of main RAM |
 | 🔍 **CPU State** | ARM9 / ARM7 registers r0–r15 (BizHawk exposes no CPSR) |
 | ⏸️ **Execution Control** | Pause, resume, and frame-advance (works while paused) |
 | 🎯 **Breakpoints** | Read / write / execute memory callbacks with hit log and optional auto-pause (MelonDS JIT must be off) |
 | 📝 **Trace** | Record executed ARM9 instruction addresses or count hotspots via exec callbacks (CPU-intensive) |
 | 💾 **Save States** | Save / load numbered slots or explicit file paths |
-| 🕹️ **DS Input** | Buttons, touchscreen taps, and batched navigation sequences |
-| 📸 **Screen Capture** | Save either screen to PNG for visual verification |
+| 🕹️ **DS Input** | Buttons, touchscreen taps, and batched navigation sequences as typed tools |
+| 📸 **Screen Capture** | `emu_ds_screenshot` returns the screen to the agent as an image (both screens or one, upscaled so pixel fonts stay legible) |
 | 🧩 **DS Graphics Helpers** | Decode OAM, DISPCNT, POWCNT, VRAMCNT, and BG tilemaps |
-| 🔄 **Patch + Reload** | `system.close_rom` / `system.open_rom` for a build-and-reload loop |
+| 🔄 **Patch + Reload** | `emu_ds_close_rom` / `emu_ds_open_rom` for a build-and-reload loop |
+| ⚡ **Socket fast path** | Optional: start EmuHawk with `--socket_ip/--socket_port` and commands use BizHawk's built-in socket client (~1 frame per call) instead of 50 ms file polling |
 
 ---
 
@@ -50,7 +51,7 @@ VRAMCNT, and BG tilemaps.
    cd BizHawk-nds-mcp
    ```
 
-2. **Install dependencies** (just the `mcp` Python SDK):
+2. **Install dependencies** (the `mcp` Python SDK, and Pillow for screenshot cropping/scaling):
    ```bash
    pip install -r requirements.txt
    ```
@@ -76,18 +77,33 @@ VRAMCNT, and BG tilemaps.
 The MCP server is the bridge between an AI agent and BizHawk:
 
 ```
-AI agent  ──MCP/stdio──►  bizhawk_mcp_server.py  ──TCP 127.0.0.1:9876──►  bizhawk_debug_api.lua  ──►  BizHawk (MelonDS)
-                                                  └── JSON-file fallback ──┘
+AI agent  ──MCP/stdio──►  bizhawk_mcp_server.py  ◄──TCP 127.0.0.1:9876 (optional)──  bizhawk_debug_api.lua  ──►  BizHawk (MelonDS)
+                                                  └──────── JSON files (default) ────────┘
 ```
 
 The server exposes each capability as an MCP tool (e.g. `emu_debug_read_memory`,
-`emu_debug_raw_command`). Commands normally travel through a **JSON file**
-exchange (`src/debug_commands.json` → `src/debug_response.json`). If you have
-installed LuaSocket for BizHawk (it isn't bundled), the bridge also listens on
-**TCP** `127.0.0.1:9876` and the server uses that first; a command that may
-already be running is never re-sent over the file channel. A heartbeat file
-(`src/debug_state.json`) lets the server detect a stale or closed bridge. All of
-these runtime files are git-ignored.
+`emu_ds_screenshot`). By default commands travel through a **JSON file**
+exchange (`src/debug_commands.json` → `src/debug_response.json`), polled every
+50 ms.
+
+**Socket fast path:** BizHawk's Lua can only make *outgoing* connections, so the
+MCP server listens on `127.0.0.1:9876` (set `BIZHAWK_MCP_PORT` to change it, or
+`off`) and the bridge connects using BizHawk's built-in `comm.socketServer*`
+client, which exists only when EmuHawk is started with the socket flags:
+
+```
+EmuHawk.exe --socket_ip=127.0.0.1 --socket_port=9876 "C:\path\to\game.nds"
+```
+
+EmuHawk connects during startup and shows a fatal error if nothing is listening,
+so **start your MCP client (which starts the server) first**, and start EmuHawk
+without the flags when the server isn't running. While connected, a command takes
+about one frame. If the server restarts, the bridge reconnects on its own (it
+finds the new server through `src/debug_server.json`) and uses the files in the
+meantime. A command that may already be running is never re-sent.
+
+A heartbeat file (`src/debug_state.json`) lets the server detect a stale or
+closed bridge. All of these runtime files are git-ignored.
 
 ---
 
@@ -103,61 +119,73 @@ emu_debug_get_emulator_state()
 ```
 
 **2. Drive the game from boot to an in-game scene in one batched command.**
-`input.sequence` runs many steps in a single round trip. `press` is a button,
-`sleep` is a wall-clock wait (frames keep advancing) for screen transitions:
+`emu_ds_input_sequence` runs many steps in a single round trip. `sleep` waits
+while frames keep advancing (60 frames per second, so real time at normal
+speed), for screen transitions:
 ```
-emu_debug_raw_command(
-  action="input.sequence",
-  params={ seq: "press A; sleep 6; press A; sleep 2.5; press A; sleep 8;
-                 press Right; sleep 0.4; press Down; sleep 0.4; press A; sleep 1" }
-)
+emu_ds_input_sequence(steps=[
+  {action: "press", button: "A"}, {action: "sleep", seconds: 6},
+  {action: "press", button: "A"}, {action: "sleep", seconds: 2.5},
+  {action: "press", button: "A"}, {action: "sleep", seconds: 8},
+  {action: "press", button: "Right"}, {action: "sleep", seconds: 0.4},
+  {action: "press", button: "Down"}, {action: "sleep", seconds: 0.4},
+  {action: "press", button: "A"}, {action: "sleep", seconds: 1}
+])
 # boots past the splash + intro, picks Continue, then navigates the menu.
 ```
 
-**3. Capture the screen to verify where you are.**
+**3. Look at the screen** (comes back as an image the agent can read, e.g. to
+check translated text):
 ```
-emu_debug_raw_command(action="screenshot.take",
-                      params={ path: "C:/BizHawk-mcp/dumps/scene.png" })
+emu_ds_screenshot(screen="bottom", scale=3)
 ```
 
 **4. Inspect the graphics hardware for the current scene.**
 ```
-emu_debug_raw_command(action="powcnt.read")
+emu_ds_read_powcnt()
 # → { powcnt1: 0x820F, lcd_swap: true, engine_a_screen: "top", ... }   (which engine drives which screen)
 
-emu_debug_raw_command(action="oam.parse", params={ engine: "sub" })
+emu_ds_parse_oam(engine="sub")
 # → { sprites: [ { idx: 0, x: 4, y: 8, tile: 0, w_tiles: 4, h_tiles: 4, palette: 5 }, ... ] }
 ```
 
 **5. Read memory by physical DS address (System Bus), e.g. main RAM.**
 ```
 emu_debug_read_memory_range(address="0x02000000", length=64)
+emu_debug_search_memory(value=1500, size=2)   # a 16-bit value, e.g. money
 ```
 
 **6. Touch the bottom screen** (see the touchscreen note in
 [NDS_SETUP.md](NDS_SETUP.md) — a BizHawk XOR quirk requires rebinding the
 `Touch` row and parking the mouse cursor):
 ```
-emu_debug_raw_command(action="input.touch", params={ x: 128, y: 96, frames: 8 })
-emu_debug_raw_command(action="input.touch_release")
+emu_ds_touch(x=128, y=96, frames=8)
+emu_ds_touch_release()
 ```
 
 **7. Rebuild the ROM and reload it without restarting BizHawk.**
 ```
-emu_debug_raw_command(action="system.close_rom")     # release the file lock
+emu_ds_close_rom()                        # release the file lock
 # ... run your patcher, overwriting the .nds on disk ...
-emu_debug_raw_command(action="system.open_rom",
-                      params={ path: "C:/path/to/patched.nds" })
+emu_ds_open_rom(path="C:/path/to/patched.nds")
 ```
 
 ---
 
 ## 🔧 Available Commands
 
-Two layers of tools. The MCP tools cover the cross-core debugging surface;
-the DS-specific helpers are reached through `emu_debug_raw_command`.
+Full reference in **[API_README.md](API_README.md)**.
 
-**Core MCP tools** — full reference in **[API_README.md](API_README.md)**:
+**Nintendo DS tools:**
+
+| Category | Tools |
+|----------|-------|
+| Screen | `emu_ds_screenshot` |
+| Input | `emu_ds_press_button`, `emu_ds_touch`, `emu_ds_touch_release`, `emu_ds_input_sequence`, `emu_ds_input_debug` |
+| ROM / system | `emu_ds_reset`, `emu_ds_close_rom`, `emu_ds_open_rom`, `emu_ds_dump_memory` |
+| Graphics | `emu_ds_read_powcnt`, `emu_ds_decode_dispcnt`, `emu_ds_decode_vramcnt`, `emu_ds_read_bg`, `emu_ds_parse_oam` |
+
+**Core debugging tools:**
 
 | Category | Tools |
 |----------|-------|
@@ -169,7 +197,8 @@ the DS-specific helpers are reached through `emu_debug_raw_command`.
 | Watch | `emu_debug_add_watch`, `emu_debug_list_watches`, `emu_debug_remove_watch`, `emu_debug_clear_watches` |
 | State / Input | `emu_debug_get_emulator_state`, `emu_debug_save_state`, `emu_debug_load_state`, `emu_debug_set_input`, `emu_debug_raw_command` |
 
-**DS-specific `raw_command` actions** — full reference in **[NDS_SETUP.md](NDS_SETUP.md)**:
+The DS tools wrap these bridge actions, which `emu_debug_raw_command` can also
+send directly (reference in **[NDS_SETUP.md](NDS_SETUP.md)**):
 
 | Group | Actions |
 |-------|---------|
@@ -188,9 +217,9 @@ the DS-specific helpers are reached through `emu_debug_raw_command`.
 │   ├── bizhawk_debug_api.lua    # BizHawk Lua bridge (load in Lua Console)
 │   └── bizhawk_mcp_server.py    # Python MCP server (socket + file IPC)
 ├── lua/
-│   └── socket.lua               # LuaSocket shim (upstream; needs the native socket.core)
+│   └── socket.lua               # LuaSocket shim (upstream; optional, only for wall-clock `sleep`)
 ├── tests/                       # Lua bridge + server tests against a BizHawk mock
-├── requirements.txt             # Python dependencies (mcp SDK)
+├── requirements.txt             # Python dependencies (mcp SDK, Pillow)
 ├── requirements-dev.txt         # + lupa (Lua 5.4) and pytest for the tests
 ├── README.md                    # This file
 ├── API_README.md                # Core MCP tool reference

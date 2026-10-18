@@ -7,7 +7,7 @@ import os
 import sys
 
 from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from mcp.client.stdio import get_default_environment, stdio_client
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -15,13 +15,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def test_initialize_list_and_call_over_stdio():
     async def scenario():
         params = StdioServerParameters(command=sys.executable,
-                                       args=[os.path.join(ROOT, "src", "bizhawk_mcp_server.py")])
+                                       args=[os.path.join(ROOT, "src", "bizhawk_mcp_server.py")],
+                                       # don't take port 9876 or announce a server in src/
+                                       env={**get_default_environment(), "BIZHAWK_MCP_PORT": "off"})
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 tools = (await session.list_tools()).tools
                 by_name = {t.name: t for t in tools}
-                assert len(by_name) == 42
+                assert len(by_name) == 57
                 def hints(name):  # wire format (2.x attributes are snake_case)
                     return by_name[name].annotations.model_dump(by_alias=True, exclude_none=True)
                 assert hints("emu_debug_read_memory")["readOnlyHint"] is True

@@ -3,6 +3,9 @@ src/debug_commands.json
 src/debug_commands.json.tmp
 src/debug_response.json
 src/debug_state.json
+src/debug_server.json
+src/debug_server.json.tmp
+src/debug_screenshot.png
 src/bizhawk_mcp.log*
 
 # Screenshots / scratch outputs from MCP sessions

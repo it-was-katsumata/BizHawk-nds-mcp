@@ -4,7 +4,8 @@
 > the server with Claude Code, and the touchscreen workaround), see
 > **[NDS_SETUP.md](NDS_SETUP.md)**. This page is the short version.
 
-> ⚠️ **Scope**: tools act on the running emulator; `emu_debug_save_state` and some
+> ⚠️ **Scope**: tools act on the running emulator; `emu_debug_save_state`,
+> `emu_ds_dump_memory`, `emu_ds_screenshot` with `savePath`, and some
 > `emu_debug_raw_command` actions also write host files (see the tool annotations).
 
 ## Installation
@@ -34,7 +35,9 @@ python src/bizhawk_mcp_server.py
 
 ## How to Send Commands
 
-Communication happens via JSON files:
+By default communication happens via JSON files (the MCP server also offers a
+socket fast path when EmuHawk is started with `--socket_ip`/`--socket_port`; see
+Step 6 of [NDS_SETUP.md](NDS_SETUP.md)):
 
 1. **Write command** to `src/debug_commands.json` with an `id` different from
    the previous command's (the bridge runs a command when the id *changes*).
