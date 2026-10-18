@@ -5,17 +5,16 @@
   Originally written for NES; this fork adapts it for Nintendo DS via
   the MelonDS core in BizHawk 2.10+.
 
-  Memory domains exposed by MelonDS in BizHawk (verified via
-  memory.getmemorydomainlist()):
-    System Bus / ARM9 System Bus / ARM7 System Bus
-    Main RAM         (0x02000000, 4 MB)
-    Main RAM (ARM7)  (0x02000000 mirror for ARM7)
-    Shared WRAM, ARM7 WRAM, ARM9 ITCM, ARM9 DTCM
-    Main Palette, Sub Palette, OAM, ARM9 BIOS, ARM7 BIOS
-    VRAM (often presented as a flat block 0x06000000 onward)
-  Use System Bus to address by physical DS address (0x02000000 main
-  RAM, 0x04000000 I/O, 0x05000000 palette, 0x06xxxxxx VRAM,
-  0x07000000 OAM).
+  Memory domains exposed by MelonDS in BizHawk 2.10 / 2.11.x (from the
+  core's GetMemoryAreas):
+    Main RAM (4 MB, offset 0 = bus 0x02000000), Shared WRAM, ARM7 WRAM,
+    SRAM, ROM, Instruction TCM, Data TCM, ARM9 BIOS, ARM7 BIOS, Firmware,
+    ARM9 System Bus, ARM7 System Bus
+  There are no separate palette / VRAM / OAM domains. Use ARM9 System Bus
+  (the default here) to address by physical DS address: 0x02000000 main
+  RAM, 0x04000000 I/O, 0x05000000 palette, 0x06xxxxxx VRAM, 0x07000000 OAM.
+  Note memory.getmemorydomainlist() is ZERO-indexed, so ipairs() over it
+  skips "Main RAM".
 
   NDS-specific actions added by this adaptation (callable via the
   Python MCP server's emu_debug_raw_command tool):
@@ -31,10 +30,11 @@
 
   Features (inherited from upstream):
   - Memory read/write/search/snapshot/compare
-  - CPU state access (ARM9 / ARM7 registers exposed by MelonDS)
-  - Execution control (pause, step, resume) - FULLY WORKING
-  - Memory breakpoints with callbacks
-  - Trace logging
+  - CPU state access (ARM9 / ARM7 r0-r15 as exposed by MelonDS; BizHawk
+    does not expose CPSR, and MelonDS cannot single-step instructions)
+  - Execution control (pause, frame step, resume)
+  - Memory breakpoints with callbacks (need MelonDS JIT disabled)
+  - Execution trace via exec callbacks (CPU-intensive, bounded)
   - Watch list
 
   Usage:
@@ -65,25 +65,18 @@ local COMMAND_FILE = BASE_PATH .. "debug_commands.json"
 local RESPONSE_FILE = BASE_PATH .. "debug_response.json"
 local TRACE_FILE = BASE_PATH .. "debug_trace.json"
 
--- NDS main RAM is 4 MB (0x02000000..0x023FFFFF).  Memory.search and
--- Memory.snapshot iterate this on the "Main RAM" domain; cap defaults
--- to a smaller range when called interactively so a full sweep doesn't
--- freeze the emulator for many seconds.
+-- NDS main RAM is 4 MB (0x02000000..0x023FFFFF). Memory.search and
+-- Memory.snapshot sweep all of it by default on ARM9 System Bus, so the
+-- addresses they report are bus addresses usable with breakpoints and
+-- memory.read. Bulk reads go through readBlock() (one host call per
+-- 64 KB), so a full sweep takes well under a second.
 local RAM_SIZE = 0x400000          -- 4 MB Main RAM (full)
-local RAM_SEARCH_DEFAULT = 0x40000 -- 256 KB default sweep
--- ARM9 System Bus is the unified domain; Main RAM lives at 0x02000000.
--- Use opts.start = 0x02000000 in Memory.search/snapshot to sweep it.
-local DEFAULT_RAM_DOMAIN = "ARM9 System Bus"
 local MAIN_RAM_BASE = 0x02000000
+local MAX_RESULTS = 1000           -- cap on search/compare entries returned
+local MAX_RANGE = 0x10000          -- cap on memory.readRange length
 
--- BizHawk's MelonDS core (verified 2.11.1) exposes these NDS domains:
---   Shared WRAM, ARM7 WRAM, SRAM, ROM, Instruction TCM, Data TCM,
---   ARM9 BIOS, ARM7 BIOS, Firmware,
---   ARM9 System Bus, ARM7 System Bus, Waterbox PageData
--- No separate Main RAM / VRAM / OAM domains — everything is reached
--- through ARM9 System Bus (which gives the ARM9's full memory map:
--- 0x02000000 main RAM, 0x04000000 I/O, 0x05000000 palette,
--- 0x06xxxxxx VRAM, 0x07000000 OAM).
+-- ARM9 System Bus gives the ARM9's full memory map (see header). It is
+-- also the only scope MelonDS offers for memory callbacks.
 local DEFAULT_SYSTEM_DOMAIN = "ARM9 System Bus"
 
 -- ═══════════════════════════════════════════════════════════════
@@ -208,90 +201,195 @@ local function readFile(path)
     return nil
 end
 
--- JSON serializer
-local function toJson(tbl)
-    if type(tbl) ~= "table" then
-        if type(tbl) == "string" then
-            return '"' .. tbl:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', ''):gsub('[\x00-\x1f]', '') .. '"'
-        elseif type(tbl) == "boolean" then
-            return tbl and "true" or "false"
-        elseif tbl == nil then
-            return "null"
-        elseif type(tbl) == "function" then
-            return "null"
-        else
-            return tostring(tbl)
-        end
-    end
-    
-    local isArray = true
-    local count = 0
-    for k, _ in pairs(tbl) do
-        count = count + 1
-        if type(k) ~= "number" or k ~= count then
-            isArray = false
-            break
-        end
-    end
-    
-    local result = isArray and "[" or "{"
-    local first = true
-    
-    if isArray then
-        for _, v in ipairs(tbl) do
-            if not first then result = result .. "," end
-            result = result .. toJson(v)
-            first = false
-        end
-    else
-        for k, v in pairs(tbl) do
-            if type(v) ~= "function" then
-                if not first then result = result .. "," end
-                result = result .. '"' .. tostring(k) .. '":' .. toJson(v)
-                first = false
-            end
-        end
-    end
-    
-    return result .. (isArray and "]" or "}")
+-- JSON serializer. Builds into a buffer (string .. in a loop is quadratic,
+-- which made large compare/trace responses crawl).
+local function jsonString(s)
+    return '"' .. s:gsub('[%c"\\]', function(c)
+        if c == '"' then return '\\"' end
+        if c == '\\' then return '\\\\' end
+        if c == '\n' then return '\\n' end
+        if c == '\r' then return '\\r' end
+        if c == '\t' then return '\\t' end
+        return string.format('\\u%04x', c:byte())
+    end) .. '"'
 end
 
--- JSON parser (simple)
-local function parseJson(str)
-    if not str or str == "" then return nil end
-    str = str:gsub("^%s+", ""):gsub("%s+$", "")
-    
-    if str:sub(1,1) == "{" then
-        local result = {}
-        for k, v in str:gmatch('"([^"]+)"%s*:%s*([^,}]+)') do
-            v = v:gsub('^%s+', ''):gsub('%s+$', ''):gsub('^"', ''):gsub('"$', '')
-            if tonumber(v) then v = tonumber(v)
-            elseif v == "true" then v = true
-            elseif v == "false" then v = false
-            elseif v == "null" then v = nil  -- Handle JSON null
-            end
-            result[k] = v
+local function encodeJson(v, buf)
+    local t = type(v)
+    if t == "string" then
+        buf[#buf + 1] = jsonString(v)
+    elseif t == "boolean" then
+        buf[#buf + 1] = v and "true" or "false"
+    elseif t == "number" then
+        -- NaN / inf are not valid JSON
+        buf[#buf + 1] = (v ~= v or v == math.huge or v == -math.huge) and "null" or tostring(v)
+    elseif t ~= "table" then
+        buf[#buf + 1] = "null"
+    else
+        local n, isArray = 0, true
+        for k in pairs(v) do
+            n = n + 1
+            if math.type(k) ~= "integer" or k < 1 then isArray = false; break end
         end
-        return result
+        if isArray and n ~= #v then isArray = false end
+        if isArray then
+            buf[#buf + 1] = "["
+            for i = 1, n do
+                if i > 1 then buf[#buf + 1] = "," end
+                encodeJson(v[i], buf)
+            end
+            buf[#buf + 1] = "]"
+        else
+            buf[#buf + 1] = "{"
+            local first = true
+            for k, val in pairs(v) do
+                if type(val) ~= "function" then
+                    if not first then buf[#buf + 1] = "," end
+                    buf[#buf + 1] = jsonString(tostring(k))
+                    buf[#buf + 1] = ":"
+                    encodeJson(val, buf)
+                    first = false
+                end
+            end
+            buf[#buf + 1] = "}"
+        end
     end
+end
+
+local function toJson(v)
+    local buf = {}
+    encodeJson(v, buf)
+    return table.concat(buf)
+end
+
+-- JSON parser. A real recursive-descent decoder: the previous pattern-based
+-- one could not handle nested objects/arrays, commas or braces inside
+-- strings, escape sequences (Windows paths, \uXXXX for non-ASCII), and
+-- turned numeric-looking strings into numbers. JSON null becomes nil.
+local function parseJson(str)
+    if type(str) ~= "string" then return nil end
+    local pos = 1
+
+    local function skip()
+        pos = str:find("[^ \t\r\n]", pos) or #str + 1
+    end
+
+    local function fail(msg)
+        error("JSON parse error at " .. pos .. ": " .. msg, 0)
+    end
+
+    local value
+
+    local function parseString()
+        pos = pos + 1  -- opening quote
+        local buf = {}
+        while true do
+            local s, e = str:find('["\\]', pos)
+            if not s then fail("unterminated string") end
+            buf[#buf + 1] = str:sub(pos, s - 1)
+            if str:sub(s, s) == '"' then
+                pos = s + 1
+                return table.concat(buf)
+            end
+            local esc = str:sub(s + 1, s + 1)
+            local simple = ({ ['"'] = '"', ['\\'] = '\\', ['/'] = '/', b = '\b',
+                              f = '\f', n = '\n', r = '\r', t = '\t' })[esc]
+            if simple then
+                buf[#buf + 1] = simple
+                pos = s + 2
+            elseif esc == "u" then
+                local cp = tonumber(str:sub(s + 2, s + 5), 16)
+                if not cp then fail("bad \\u escape") end
+                pos = s + 6
+                if cp >= 0xD800 and cp <= 0xDBFF and str:sub(pos, pos + 1) == "\\u" then
+                    local lo = tonumber(str:sub(pos + 2, pos + 5), 16)
+                    if lo and lo >= 0xDC00 and lo <= 0xDFFF then
+                        cp = 0x10000 + (cp - 0xD800) * 0x400 + (lo - 0xDC00)
+                        pos = pos + 6
+                    end
+                end
+                buf[#buf + 1] = utf8.char(cp)
+            else
+                fail("bad escape")
+            end
+        end
+    end
+
+    function value()
+        skip()
+        local c = str:sub(pos, pos)
+        if c == "{" then
+            pos = pos + 1
+            local obj = {}
+            skip()
+            if str:sub(pos, pos) == "}" then pos = pos + 1; return obj end
+            while true do
+                skip()
+                if str:sub(pos, pos) ~= '"' then fail("expected key") end
+                local k = parseString()
+                skip()
+                if str:sub(pos, pos) ~= ":" then fail("expected ':'") end
+                pos = pos + 1
+                obj[k] = value()
+                skip()
+                local d = str:sub(pos, pos)
+                pos = pos + 1
+                if d == "}" then return obj end
+                if d ~= "," then fail("expected ',' or '}'") end
+            end
+        elseif c == "[" then
+            pos = pos + 1
+            local arr, n = {}, 0
+            skip()
+            if str:sub(pos, pos) == "]" then pos = pos + 1; return arr end
+            while true do
+                n = n + 1
+                arr[n] = value()
+                skip()
+                local d = str:sub(pos, pos)
+                pos = pos + 1
+                if d == "]" then return arr end
+                if d ~= "," then fail("expected ',' or ']'") end
+            end
+        elseif c == '"' then
+            return parseString()
+        elseif str:sub(pos, pos + 3) == "true" then
+            pos = pos + 4; return true
+        elseif str:sub(pos, pos + 4) == "false" then
+            pos = pos + 5; return false
+        elseif str:sub(pos, pos + 3) == "null" then
+            pos = pos + 4; return nil
+        else
+            local num = str:match("^-?%d+%.?%d*[eE]?[-+]?%d*", pos)
+            local n = num and tonumber(num)
+            if not n then fail("unexpected character") end
+            pos = pos + #num
+            return math.tointeger(n) or n
+        end
+    end
+
+    local ok, result = pcall(value)
+    if not ok then return nil, result end
+    return result
+end
+
+-- Parse an address: number, "$hex", "0xhex", decimal digits, or bare hex
+-- containing a-f (same rules as normalize_address in the Python server).
+-- Returns nil for anything else.
+local function parseAddress(addr)
+    if type(addr) == "number" then return math.tointeger(addr) end
+    if type(addr) ~= "string" then return nil end
+    local s = addr:match("^%s*(.-)%s*$")
+    local hex = s:match("^%$(%x+)$") or s:match("^0[xX](%x+)$")
+    if hex then return tonumber(hex, 16) end
+    if s:match("^%d+$") then return tonumber(s) end
+    if s:match("^%x+$") then return tonumber(s, 16) end
     return nil
 end
 
--- Parse hex or decimal address
-local function parseAddress(addr)
-    if type(addr) == "number" then return addr end
-    if type(addr) == "string" then
-        if addr:sub(1,2) == "0x" or addr:sub(1,1) == "$" then
-            return tonumber(addr:gsub("[$0x]", ""), 16)
-        end
-        return tonumber(addr)
-    end
-    return 0
-end
-
--- Format address as hex
+-- Format address as hex (NDS addresses are 32-bit)
 local function hexAddr(addr)
-    return string.format("$%04X", addr)
+    return string.format("$%08X", addr or 0)
 end
 
 local function hexByte(val)
@@ -323,22 +421,58 @@ end
 -- Initialize with the NDS unified address domain
 setMemoryDomain(DEFAULT_SYSTEM_DOMAIN)
 
+-- getmemorydomainlist() is zero-indexed; return a plain 1-indexed list.
+function Memory.getDomains()
+    local raw = memory.getmemorydomainlist() or {}
+    local list = {}
+    local i = raw[0] ~= nil and 0 or 1
+    while raw[i] ~= nil do
+        list[#list + 1] = raw[i]
+        i = i + 1
+    end
+    return list
+end
+
+-- Resolve a domain argument. BizHawk silently falls back to the current
+-- domain on an unknown name, which turned typos into reads/writes at the
+-- same offset in the wrong domain, so unknown names are an error here.
+local function resolveDomain(domain)
+    if domain == nil or domain == "" or domain == "null" or domain == DEFAULT_SYSTEM_DOMAIN then
+        return DEFAULT_SYSTEM_DOMAIN  -- fast path: Freeze.apply calls this every frame
+    end
+    for _, d in ipairs(Memory.getDomains()) do
+        if d == domain then return domain end
+    end
+    return nil, "Unknown memory domain '" .. tostring(domain) ..
+        "' (see memory.getDomains / emu_debug_list_memory_domains)"
+end
+
+-- Read `length` bytes as a binary string, one host call per 64 KB.
+local function readBlock(addr, length, domain)
+    local parts = {}
+    local CHUNK = 0x10000
+    for off = 0, length - 1, CHUNK do
+        local n = math.min(CHUNK, length - off)
+        if memory.read_bytes_as_binary_string then  -- BizHawk 2.11.1+
+            parts[#parts + 1] = memory.read_bytes_as_binary_string(addr + off, n, domain)
+        else
+            local bytes = memory.read_bytes_as_array(addr + off, n, domain)
+            for i = 1, n, 4096 do
+                parts[#parts + 1] = string.char(table.unpack(bytes, i, math.min(i + 4095, n)))
+            end
+        end
+    end
+    return table.concat(parts)
+end
+
 function Memory.read(addr, domain)
     addr = parseAddress(addr)
     if addr == nil then
         return { error = "Invalid address" }
     end
-    
-    -- Handle nil, empty string, or "null" domain
-    if domain and domain ~= "" and domain ~= "null" then
-        local oldDomain = memory.getcurrentmemorydomain()
-        setMemoryDomain(domain)
-        local val = memory.readbyte(addr)
-        setMemoryDomain(oldDomain)
-        return val
-    end
-    
-    return memory.readbyte(addr)
+    local d, err = resolveDomain(domain)
+    if not d then return { error = err } end
+    return memory.readbyte(addr, d)
 end
 
 function Memory.write(addr, value, domain)
@@ -346,146 +480,142 @@ function Memory.write(addr, value, domain)
     if addr == nil then
         return { error = "Invalid address" }
     end
-    
-    -- Handle nil, empty string, or "null" domain
-    if domain and domain ~= "" and domain ~= "null" then
-        local oldDomain = memory.getcurrentmemorydomain()
-        setMemoryDomain(domain)
-        memory.writebyte(addr, value)
-        setMemoryDomain(oldDomain)
-        return
+    if math.type(value) ~= "integer" or value < 0 or value > 255 then
+        return { error = "Invalid value: must be an integer 0-255" }
     end
-    
-    memory.writebyte(addr, value)
+    local d, err = resolveDomain(domain)
+    if not d then return { error = err } end
+    memory.writebyte(addr, value, d)
+    return { written = true }
 end
 
 function Memory.readRange(startAddr, length, domain)
     startAddr = parseAddress(startAddr)
-    
+
     -- Validate startAddr
     if startAddr == nil then
         return { error = "Invalid address: address parameter is nil or invalid" }
     end
-    
+
     -- Validate length
     length = length or 16  -- Default to 16 bytes
-    if type(length) ~= "number" or length < 1 then
-        return { error = "Invalid length: must be a positive number" }
+    if math.type(length) ~= "integer" or length < 1 or length > MAX_RANGE then
+        return { error = "Invalid length: must be an integer 1-" .. MAX_RANGE }
     end
-    
-    local data = {}
-    
-    -- Handle nil, empty string, or "null" domain
-    if domain and domain ~= "" and domain ~= "null" then
-        local oldDomain = memory.getcurrentmemorydomain()
-        setMemoryDomain(domain)
-        for i = 0, length - 1 do
-            table.insert(data, memory.readbyte(startAddr + i))
-        end
-        setMemoryDomain(oldDomain)
-        return data
+    local d, err = resolveDomain(domain)
+    if not d then return { error = err } end
+    return { readBlock(startAddr, length, d):byte(1, -1) }
+end
+
+-- Region options shared by search/snapshot: {domain, start, length}.
+-- Defaults to all of main RAM on ARM9 System Bus.
+local function resolveRegion(opts)
+    opts = opts or {}
+    local d, err = resolveDomain(opts.domain)
+    if not d then return nil, err end
+    local start
+    if opts.start == nil then
+        start = (d == DEFAULT_SYSTEM_DOMAIN or d == "ARM7 System Bus") and MAIN_RAM_BASE or 0
+    else
+        start = parseAddress(opts.start)
+        if start == nil then return nil, "Invalid start address" end
     end
-    
-    for i = 0, length - 1 do
-        table.insert(data, memory.readbyte(startAddr + i))
+    local length = opts.length or RAM_SIZE
+    if math.type(length) ~= "integer" or length < 1 or length > RAM_SIZE then
+        return nil, "Invalid length: must be an integer 1-" .. RAM_SIZE
     end
-    return data
+    return { domain = d, start = start, length = length }
 end
 
 function Memory.search(value, opts)
-    opts = opts or {}
-    local domain = opts.domain or DEFAULT_RAM_DOMAIN
-    local startAddr = opts.start or 0
-    local endAddr = opts.endAddr or (startAddr + RAM_SEARCH_DEFAULT)
-    local results = {}
-    setMemoryDomain(domain)
-    for addr = startAddr, endAddr - 1 do
-        if memory.readbyte(addr) == value then
-            table.insert(results, {
-                address = addr,
-                hex = hexAddr(addr),
-                value = value
-            })
-        end
+    if math.type(value) ~= "integer" or value < 0 or value > 255 then
+        return { error = "Invalid value: must be an integer 0-255" }
     end
-    setMemoryDomain(DEFAULT_SYSTEM_DOMAIN)
-    return results
-end
-
-function Memory.searchRange(minVal, maxVal, opts)
-    opts = opts or {}
-    local domain = opts.domain or DEFAULT_RAM_DOMAIN
-    local startAddr = opts.start or 0
-    local endAddr = opts.endAddr or (startAddr + RAM_SEARCH_DEFAULT)
-    local results = {}
-    setMemoryDomain(domain)
-    for addr = startAddr, endAddr - 1 do
-        local val = memory.readbyte(addr)
-        if val >= minVal and val <= maxVal then
-            table.insert(results, {
-                address = addr,
-                hex = hexAddr(addr),
-                value = val
-            })
+    local region, err = resolveRegion(opts)
+    if not region then return { error = err } end
+    local block = readBlock(region.start, region.length, region.domain)
+    local results, total = {}, 0
+    local needle = string.char(value)
+    local i = block:find(needle, 1, true)
+    while i do
+        total = total + 1
+        if total <= MAX_RESULTS then
+            local addr = region.start + i - 1
+            results[total] = { address = addr, hex = hexAddr(addr), value = value }
         end
+        i = block:find(needle, i + 1, true)
     end
-    setMemoryDomain(DEFAULT_SYSTEM_DOMAIN)
-    return results
+    return results, total
 end
 
 function Memory.snapshot(name, opts)
     name = name or "default"
-    opts = opts or {}
-    local domain = opts.domain or DEFAULT_RAM_DOMAIN
-    local startAddr = opts.start or 0
-    local endAddr = opts.endAddr or (startAddr + RAM_SEARCH_DEFAULT)
-    local data = {}
-    setMemoryDomain(domain)
-    for addr = startAddr, endAddr - 1 do
-        data[addr] = memory.readbyte(addr)
-    end
-    setMemoryDomain(DEFAULT_SYSTEM_DOMAIN)
-    snapshots[name] = { data = data, start = startAddr, endAddr = endAddr, domain = domain }
-    return { name = name, size = endAddr - startAddr, domain = domain }
+    local region, err = resolveRegion(opts)
+    if not region then return { error = err } end
+    region.data = readBlock(region.start, region.length, region.domain)
+    snapshots[name] = region
+    return { name = name, size = region.length, domain = region.domain,
+             start = hexAddr(region.start) }
 end
 
-function Memory.compare(name, filter)
+-- opts: addresses (only compare these), oldValue (keep entries whose old
+-- byte equals it), minDelta (keep entries with |diff| >= it).
+-- Returns (changes capped at MAX_RESULTS, total matches).
+function Memory.compare(name, filter, opts)
     name = name or "default"
     filter = filter or "changed"
+    opts = opts or {}
 
     local snapshot = snapshots[name]
-    if not snapshot then return { error = "Snapshot not found" } end
+    if not snapshot then return { error = "Snapshot not found: " .. tostring(name) } end
+    if filter ~= "changed" and filter ~= "increased" and filter ~= "decreased"
+        and filter ~= "same" and filter ~= "unchanged" then
+        return { error = "Invalid filter: use changed/increased/decreased/same" }
+    end
 
-    local changes = {}
-    setMemoryDomain(snapshot.domain or DEFAULT_RAM_DOMAIN)
-    for addr = snapshot.start, snapshot.endAddr - 1 do
-        local current = memory.readbyte(addr)
-        local old = snapshot.data[addr]
-        local diff = current - old
+    local current = readBlock(snapshot.start, snapshot.length, snapshot.domain)
+    local old = snapshot.data
+    local changes, total = {}, 0
 
-        local include = false
+    local function consider(i)
+        local o, c = old:byte(i), current:byte(i)
+        local diff = c - o
+        local include
         if filter == "changed" then include = (diff ~= 0)
         elseif filter == "increased" then include = (diff > 0)
         elseif filter == "decreased" then include = (diff < 0)
-        elseif filter == "same" then include = (diff == 0)
+        else include = (diff == 0)
         end
-
+        if include and opts.oldValue ~= nil then include = (o == opts.oldValue) end
+        if include and opts.minDelta ~= nil then include = (math.abs(diff) >= opts.minDelta) end
         if include then
-            table.insert(changes, {
-                address = addr,
-                hex = hexAddr(addr),
-                old = old,
-                new = current,
-                diff = diff
-            })
+            total = total + 1
+            if total <= MAX_RESULTS then
+                local addr = snapshot.start + i - 1
+                changes[total] = { address = addr, hex = hexAddr(addr), old = o, new = c, diff = diff }
+            end
         end
     end
-    setMemoryDomain(DEFAULT_SYSTEM_DOMAIN)
-    return changes
-end
 
-function Memory.getDomains()
-    return memory.getmemorydomainlist()
+    if type(opts.addresses) == "table" then
+        for _, a in ipairs(opts.addresses) do
+            local addr = parseAddress(a)
+            local i = addr and (addr - snapshot.start + 1)
+            if i and i >= 1 and i <= snapshot.length then consider(i) end
+        end
+    elseif filter == "same" or filter == "unchanged" then
+        for i = 1, snapshot.length do consider(i) end
+    else
+        -- Skip identical 4 KB pages wholesale; only diff pages that changed.
+        local PAGE = 4096
+        for p = 1, snapshot.length, PAGE do
+            local q = math.min(p + PAGE - 1, snapshot.length)
+            if old:sub(p, q) ~= current:sub(p, q) then
+                for i = p, q do consider(i) end
+            end
+        end
+    end
+    return changes, total
 end
 
 -- ═══════════════════════════════════════════════════════════════
@@ -494,75 +624,43 @@ end
 
 local CPU = {}
 
+-- MelonDS exposes "ARM9 r0".."ARM9 r15" and "ARM7 r0".."ARM7 r15" (no CPSR,
+-- so no flags or Thumb bit). r15 is the core's pipelined PC, which runs
+-- ahead of the executing instruction; exec breakpoints report the exact
+-- instruction address instead.
 function CPU.getState()
-    -- emu.getregisters() returns the active core's CPU registers
-    -- (ARM9 / ARM7 on the MelonDS core)
     local regs = emu.getregisters()
     if not regs then
         return { error = "Cannot get CPU state" }
     end
-    
-    local a = regs.A or regs.a or 0
-    local x = regs.X or regs.x or 0
-    local y = regs.Y or regs.y or 0
-    local sp = regs.S or regs.SP or regs.sp or 0
-    local pc = regs.PC or regs.pc or 0
-    local ps = regs.P or regs.PS or regs.ps or 0
-    
-    return {
-        -- Registers
-        A = a,
-        X = x,
-        Y = y,
-        SP = sp,
-        PC = pc,
-        
-        -- Hex formatted
-        A_hex = hexByte(a),
-        X_hex = hexByte(x),
-        Y_hex = hexByte(y),
-        SP_hex = hexByte(sp),
-        PC_hex = hexAddr(pc),
-        
-        -- Flags
-        flags = {
-            N = (ps & 0x80) ~= 0, -- Negative
-            V = (ps & 0x40) ~= 0, -- Overflow
-            B = (ps & 0x10) ~= 0, -- Break
-            D = (ps & 0x08) ~= 0, -- Decimal
-            I = (ps & 0x04) ~= 0, -- Interrupt
-            Z = (ps & 0x02) ~= 0, -- Zero
-            C = (ps & 0x01) ~= 0  -- Carry
-        },
-        
-        -- Status register
-        PS = ps,
-        PS_hex = hexByte(ps),
-        
-        -- Frame count
-        frameCount = emu.framecount()
-    }
+    local state = { frameCount = emu.framecount() }
+    for _, n in ipairs({ 9, 7 }) do
+        local cpu = {}
+        for r = 0, 15 do
+            cpu["r" .. r] = regs["ARM" .. n .. " r" .. r] or 0
+        end
+        cpu.sp, cpu.lr, cpu.pc = cpu.r13, cpu.r14, cpu.r15
+        state["arm" .. n] = cpu
+    end
+    return state
 end
 
 function CPU.getRegisters()
     local state = CPU.getState()
-    if state.error then
-        return { A = "$00", X = "$00", Y = "$00", SP = "$00", PC = "$0000", PS = "$00" }
+    if state.error then return state end
+    local out = {}
+    for _, k in ipairs({ "arm9", "arm7" }) do
+        local h = {}
+        for r = 0, 15 do h["r" .. r] = hexAddr(state[k]["r" .. r]) end
+        out[k] = h
     end
-    return {
-        A = state.A_hex,
-        X = state.X_hex,
-        Y = state.Y_hex,
-        SP = state.SP_hex,
-        PC = state.PC_hex,
-        PS = state.PS_hex
-    }
+    return out
 end
 
 function CPU.getPC()
     local regs = emu.getregisters()
     if not regs then return 0 end
-    return regs.PC or regs.pc or 0
+    return regs["ARM9 r15"] or 0
 end
 
 -- ═══════════════════════════════════════════════════════════════
@@ -609,30 +707,50 @@ function Execution.resume()
     }
 end
 
+-- Advance n frames, honouring the pause state. EmuHawk only resumes a
+-- script blocked in emu.frameadvance() right before it emulates a frame,
+-- so calling it while paused hangs the bridge until someone unpauses by
+-- hand. Unpause around each frame and restore the pause afterwards.
+local function advanceFrames(n)
+    local wasPaused = isPausedState
+    if client.ispaused then
+        local ok, p = pcall(client.ispaused)
+        wasPaused = wasPaused or (ok and p)
+    end
+    for _ = 1, n do
+        if wasPaused then client.unpause() end
+        emu.frameadvance()
+    end
+    if wasPaused then
+        client.pause()
+        isPausedState = true
+        currentState = STATE_PAUSED
+    end
+end
+
 -- STEP - Frame advance
 function Execution.step(count, stepType)
     count = count or 1
     stepType = stepType or "frame"
-    
-    local pcBefore = CPU.getPC()
-    
-    if stepType == "frame" then
-        for i = 1, count do
-            emu.frameadvance()
-        end
-    elseif stepType == "instruction" then
-        -- BizHawk doesn't have single instruction step in all cores
-        -- Use emu.yield() or short frame advances
-        for i = 1, count do
-            emu.yield()
-        end
+    if math.type(count) ~= "integer" or count < 1 then
+        return { error = "Invalid count: must be a positive integer" }
     end
-    
+    if stepType ~= "frame" then
+        -- MelonDS reports IDebuggable.CanStep == false: there is no
+        -- instruction stepping in BizHawk for NDS. (The old "instruction"
+        -- mode called emu.yield(), which steps nothing.)
+        return { error = "Only stepType='frame' is supported on the MelonDS core" }
+    end
+
+    local pcBefore = CPU.getPC()
+    advanceFrames(count)
+
     return {
         stepped = count,
         type = stepType,
         pcBefore = hexAddr(pcBefore),
-        newPC = hexAddr(CPU.getPC())
+        newPC = hexAddr(CPU.getPC()),
+        frameCount = emu.framecount()
     }
 end
 
@@ -646,58 +764,63 @@ local Breakpoints = {}
 function Breakpoints.add(bpType, addr, options)
     addr = parseAddress(addr)
     options = options or {}
-    
+    -- A nil address would make BizHawk fire on EVERY access of that type.
+    if addr == nil then
+        return { error = "Invalid address" }
+    end
+    local register = ({ read = event.onmemoryread, write = event.onmemorywrite,
+                        execute = event.onmemoryexecute })[bpType]
+    if not register then
+        return { error = "Invalid breakpoint type: " .. tostring(bpType) }
+    end
+
     local id = nextBreakpointId
     nextBreakpointId = nextBreakpointId + 1
-    
-    -- Create callback function
+
+    -- Runs inside the core's memory callback: keep it cheap (no file I/O,
+    -- no console spam) since hot addresses can fire thousands of times a frame.
     local callback = function(address, value, flags)
-        local pc = CPU.getPC()
-        local regs = CPU.getRegisters()
-        
+        -- For execute breakpoints `address` is the exact instruction address.
+        local pc = (bpType == "execute") and address or CPU.getPC()
         local info = {
             breakpointId = id,
             type = bpType,
             address = hexAddr(address),
             value = value,
             PC = hexAddr(pc),
-            registers = regs,
+            registers = CPU.getRegisters(),
             timestamp = os.time(),
             frameCount = emu.framecount()
         }
-        
+
         -- Add to hit queue
         table.insert(breakpointHitQueue, info)
         if #breakpointHitQueue > maxQueueSize then
             table.remove(breakpointHitQueue, 1)
         end
-        
-        -- Update hit count
-        if breakpoints[id] then
-            breakpoints[id].hitCount = (breakpoints[id].hitCount or 0) + 1
+
+        local bp = breakpoints[id]
+        if bp then
+            bp.hitCount = (bp.hitCount or 0) + 1
+            if bp.hitCount == 1 then
+                log("Breakpoint " .. id .. " first hit at PC " .. hexAddr(pc))
+            end
         end
-        
-        -- Write break info to file
-        writeFile(BASE_PATH .. "debug_break.json", toJson(info))
-        log("Breakpoint Hit at " .. hexAddr(pc) .. " address=" .. hexAddr(address) .. " value=" .. tostring(value))
-        
-        -- Pause if autoPauseMode is enabled
+
+        -- Pause if autoPauseMode is enabled (takes effect at the end of
+        -- the current frame, not at the instruction)
         if autoPauseMode then
             client.pause()
             isPausedState = true
         end
     end
-    
-    -- Register the appropriate event
-    local eventGuid = nil
-    if bpType == "read" then
-        eventGuid = event.onmemoryread(callback, addr, DEFAULT_SYSTEM_DOMAIN)
-    elseif bpType == "write" then
-        eventGuid = event.onmemorywrite(callback, addr, DEFAULT_SYSTEM_DOMAIN)
-    elseif bpType == "execute" then
-        eventGuid = event.onmemoryexecute(callback, addr, DEFAULT_SYSTEM_DOMAIN)
-    else
-        return { error = "Invalid breakpoint type: " .. tostring(bpType) }
+
+    -- event.onmemory*(fn, address, name, scope): the 3rd argument is the
+    -- callback's name, the 4th the memory scope.
+    local ok, eventGuid = pcall(register, callback, addr, "bp" .. id, DEFAULT_SYSTEM_DOMAIN)
+    if not ok then
+        return { error = "Could not register memory callback (" .. tostring(eventGuid) ..
+            "). MelonDS memory callbacks require JIT to be disabled in the NDS sync settings." }
     end
     
     -- Store breakpoint info
@@ -779,16 +902,43 @@ end
 -- TRACE LOGGER API
 -- ═══════════════════════════════════════════════════════════════
 
+-- Execution trace via event.onmemoryexecuteany: fires before every ARM9
+-- instruction, so it is CPU-intensive. Recording stops by itself after
+-- `limit` instructions (default traceMaxLines). Requires JIT disabled.
 local Trace = {}
+local traceGuid = nil
 
-function Trace.start()
-    traceEnabled = true
+local function stopTraceCallback()
+    if traceGuid then
+        pcall(event.unregisterbyid, traceGuid)
+        traceGuid = nil
+    end
+    traceEnabled = false
+end
+
+function Trace.start(limit)
+    limit = limit or traceMaxLines
+    if math.type(limit) ~= "integer" or limit < 1 or limit > traceMaxLines then
+        return { error = "Invalid limit: must be an integer 1-" .. traceMaxLines }
+    end
+    stopTraceCallback()
     traceLog = {}
-    return { tracing = true }
+    local ok, guid = pcall(event.onmemoryexecuteany, function(addr)
+        local n = #traceLog + 1
+        traceLog[n] = { pc = hexAddr(addr) }
+        if n >= limit then stopTraceCallback() end
+    end, "trace", DEFAULT_SYSTEM_DOMAIN)
+    if not ok then
+        return { error = "Could not register exec callback (" .. tostring(guid) ..
+            "). Tracing requires JIT to be disabled in the NDS sync settings." }
+    end
+    traceGuid = guid
+    traceEnabled = true
+    return { tracing = true, limit = limit }
 end
 
 function Trace.stop()
-    traceEnabled = false
+    stopTraceCallback()
     return { tracing = false, lineCount = #traceLog }
 end
 
@@ -807,25 +957,38 @@ function Trace.get(count)
     return result
 end
 
-function Trace.logInstruction()
-    if not traceEnabled then return end
-    if #traceLog >= traceMaxLines then
-        table.remove(traceLog, 1)
+-- Count executed ARM9 instruction addresses over `frames` frames and
+-- return the `topN` hottest. Every instruction runs a Lua callback, so
+-- emulation slows down drastically while this runs; keep frames small.
+function Trace.hotspots(frames, topN)
+    frames = frames or 1
+    topN = topN or 20
+    if math.type(frames) ~= "integer" or frames < 1 or frames > 60 then
+        return { error = "Invalid frames: must be an integer 1-60" }
     end
-    
-    local cpu = CPU.getState()
-    local pc = CPU.getPC()
-    local opcode = Memory.read(pc)
+    stopTraceCallback()
+    local counts, total = {}, 0
+    local ok, guid = pcall(event.onmemoryexecuteany, function(addr)
+        counts[addr] = (counts[addr] or 0) + 1
+        total = total + 1
+    end, "hotspots", DEFAULT_SYSTEM_DOMAIN)
+    if not ok then
+        return { error = "Could not register exec callback (" .. tostring(guid) ..
+            "). Tracing requires JIT to be disabled in the NDS sync settings." }
+    end
+    local advanced = pcall(advanceFrames, frames)
+    pcall(event.unregisterbyid, guid)
+    if not advanced then return { error = "frame advance failed while tracing" } end
 
-    table.insert(traceLog, {
-        pc = hexAddr(pc),
-        asm = string.format("%02X", opcode),
-        a = cpu.A_hex,
-        x = cpu.X_hex,
-        y = cpu.Y_hex,
-        sp = cpu.SP_hex,
-        ps = cpu.PS_hex
-    })
+    local list = {}
+    for addr, c in pairs(counts) do list[#list + 1] = { addr = addr, count = c } end
+    table.sort(list, function(a, b) return a.count > b.count end)
+    local top = {}
+    for i = 1, math.min(topN, #list) do
+        top[i] = { pc = hexAddr(list[i].addr), count = list[i].count }
+    end
+    return { framesTraced = frames, instructionsExecuted = total,
+             uniqueAddresses = #list, hotspots = top }
 end
 
 -- ═══════════════════════════════════════════════════════════════
@@ -836,6 +999,7 @@ local Watch = {}
 
 function Watch.add(addr, name)
     addr = parseAddress(addr)
+    if addr == nil then return { error = "Invalid address" } end
     watchedAddresses[addr] = {
         address = addr,
         hex = hexAddr(addr),
@@ -847,6 +1011,7 @@ end
 
 function Watch.remove(addr)
     addr = parseAddress(addr)
+    if addr == nil then return { error = "Invalid address" } end
     watchedAddresses[addr] = nil
     return { removed = addr }
 end
@@ -874,11 +1039,13 @@ local Freeze = {}
 
 function Freeze.add(addr, value, label, domain)
     addr = parseAddress(addr)
-    
-    -- Normalize domain (nil, empty, or "null" becomes default = ARM9 System Bus on NDS)
-    if domain == nil or domain == "" or domain == "null" then
-        domain = DEFAULT_SYSTEM_DOMAIN
+    if addr == nil then return { error = "Invalid address" } end
+    if math.type(value) ~= "integer" or value < 0 or value > 255 then
+        return { error = "Invalid value: must be an integer 0-255" }
     end
+    local err
+    domain, err = resolveDomain(domain)
+    if not domain then return { error = err } end
     
     -- Check freeze limit
     local count = 0
@@ -933,6 +1100,7 @@ function Freeze.remove(id, addr, removeAll)
     
     if addr then
         addr = parseAddress(addr)
+        if addr == nil then return { error = "Invalid address" } end
         for fid, freeze in pairs(frozenAddresses) do
             if freeze.address == addr then
                 frozenAddresses[fid] = nil
@@ -966,34 +1134,35 @@ end
 -- COMMAND PROCESSOR
 -- ═══════════════════════════════════════════════════════════════
 
-local function processCommand(cmd)
-    if not cmd or not cmd.action then
-        return { error = "Invalid command" }
+local function dispatchCommand(cmd)
+    if type(cmd) ~= "table" or not cmd.action then
+        return { success = false, error = "Invalid command" }
     end
-    
+
     local action = cmd.action
     local response = { success = true, action = action }
-    
+    local region = { domain = cmd.domain, start = cmd.start, length = cmd.length }
+
     -- Memory commands
     if action == "memory.read" then
         response.data = Memory.read(cmd.address, cmd.domain)
-        
+
     elseif action == "memory.write" then
-        Memory.write(cmd.address, cmd.value, cmd.domain)
-        response.data = { written = true }
-        
+        response.data = Memory.write(cmd.address, cmd.value, cmd.domain)
+
     elseif action == "memory.readRange" then
         response.data = Memory.readRange(cmd.address, cmd.length, cmd.domain)
-        
+
     elseif action == "memory.search" then
-        response.data = Memory.search(cmd.value)
-        
+        response.data, response.total = Memory.search(cmd.value, region)
+
     elseif action == "memory.snapshot" then
-        response.data = Memory.snapshot(cmd.name)
-        
+        response.data = Memory.snapshot(cmd.name, region)
+
     elseif action == "memory.compare" then
-        response.data = Memory.compare(cmd.name, cmd.filter)
-        
+        response.data, response.total = Memory.compare(cmd.name, cmd.filter, {
+            addresses = cmd.addresses, oldValue = cmd.oldValue, minDelta = cmd.minDelta })
+
     elseif action == "memory.getDomains" then
         response.data = Memory.getDomains()
         
@@ -1022,7 +1191,8 @@ local function processCommand(cmd)
         response.data = Breakpoints.add(cmd.type, cmd.address, cmd.options)
         
     elseif action == "breakpoint.remove" then
-        response.data = Breakpoints.remove(cmd.id)
+        -- `id` is the command envelope's id; the breakpoint id is `bpId`.
+        response.data = Breakpoints.remove(cmd.bpId)
         
     elseif action == "breakpoint.list" then
         response.data = Breakpoints.list()
@@ -1044,8 +1214,11 @@ local function processCommand(cmd)
 
     -- Trace commands
     elseif action == "trace.start" then
-        response.data = Trace.start()
-        
+        response.data = Trace.start(cmd.limit)
+
+    elseif action == "trace.hotspots" then
+        response.data = Trace.hotspots(cmd.frames, cmd.topN)
+
     elseif action == "trace.stop" then
         response.data = Trace.stop()
         
@@ -1073,30 +1246,36 @@ local function processCommand(cmd)
         response.data = Freeze.add(cmd.address, cmd.value, cmd.label, cmd.domain)
         
     elseif action == "freeze.remove" then
-        response.data = Freeze.remove(cmd.id, cmd.address, cmd.removeAll)
+        -- `id` is the command envelope's id; the freeze id is `freezeId`.
+        response.data = Freeze.remove(cmd.freezeId, cmd.address, cmd.removeAll)
         
     elseif action == "freeze.list" then
         response.data = Freeze.list()
         
     -- Save state commands
+    -- savestate.* return false on failure (missing slot/file); slots are 1-10.
     elseif action == "state.save" then
         if cmd.slot then
-            savestate.saveslot(cmd.slot)
-            response.data = { saved = true, slot = cmd.slot }
+            local ok = savestate.saveslot(cmd.slot)
+            response.data = ok == false and { error = "Save to slot " .. tostring(cmd.slot) .. " failed" }
+                or { saved = true, slot = cmd.slot }
         elseif cmd.path then
-            savestate.save(cmd.path)
-            response.data = { saved = true, path = cmd.path }
+            local ok = savestate.save(cmd.path)
+            response.data = ok == false and { error = "Save to " .. tostring(cmd.path) .. " failed" }
+                or { saved = true, path = cmd.path }
         else
             response.data = { error = "No slot or path specified" }
         end
-        
+
     elseif action == "state.load" then
         if cmd.slot then
-            savestate.loadslot(cmd.slot)
-            response.data = { loaded = true, slot = cmd.slot }
+            local ok = savestate.loadslot(cmd.slot)
+            response.data = ok == false and { error = "No savestate in slot " .. tostring(cmd.slot) }
+                or { loaded = true, slot = cmd.slot }
         elseif cmd.path then
-            savestate.load(cmd.path)
-            response.data = { loaded = true, path = cmd.path }
+            local ok = savestate.load(cmd.path)
+            response.data = ok == false and { error = "Could not load savestate " .. tostring(cmd.path) }
+                or { loaded = true, path = cmd.path }
         else
             response.data = { error = "No slot or path specified" }
         end
@@ -1121,6 +1300,8 @@ local function processCommand(cmd)
         -- and only respond to joypad.setanalog. Wrong API or wrong name
         -- gets silently dropped, which caused the long-standing
         -- "Touch=true fires but coords ignored" symptom.
+        -- NDS button names carry no "P1 " prefix ("A", "Up", "Touch"); the
+        -- prefixed form is kept for other cores, as input.press does.
         local analog_input = {}
         for btn, val in pairs(buttons) do
             if btn == "Touch" then
@@ -1129,10 +1310,11 @@ local function processCommand(cmd)
                 analog_input["Touch X"] = val
             elseif btn == "TouchY" or btn == "Touch Y" then
                 analog_input["Touch Y"] = val
-            elseif val == true then
-                joypad_input["P" .. player .. " " .. btn] = true
+            elseif type(val) == "boolean" then
+                joypad_input[btn] = val
+                joypad_input["P" .. player .. " " .. btn] = val
             elseif type(val) == "number" then
-                analog_input["P" .. player .. " " .. btn] = val
+                analog_input[btn] = val
             end
         end
 
@@ -1200,6 +1382,9 @@ local function processCommand(cmd)
         local ds = joypad.get() or {}
         ds["Touch"] = false
         joypad.set(ds)
+        -- setanalog values are sticky autoholds; "" clears them, so later
+        -- frames stop XOR-ing a stale coordinate against the mouse.
+        joypad.setanalog({ ["Touch X"] = "", ["Touch Y"] = "" })
         response.data = { released = true }
 
     elseif action == "input.debug" then
@@ -1413,9 +1598,11 @@ local function processCommand(cmd)
 
     elseif action == "frame.advance" then
         local n = cmd.frames or 1
-        for _ = 1, n do
-            emu.frameadvance()
+        if math.type(n) ~= "integer" or n < 1 then
+            response.data = { error = "frames must be a positive integer" }
+            return response
         end
+        advanceFrames(n)
         response.data = { advanced = n, frameCount = emu.framecount() }
 
     elseif action == "memory.dump_to_file" then
@@ -1425,24 +1612,22 @@ local function processCommand(cmd)
         local addr = parseAddress(cmd.address or 0)
         local length = cmd.length or 0
         local path = cmd.path
-        local domain = cmd.domain or DEFAULT_SYSTEM_DOMAIN
-        if not path or length <= 0 then
+        local domain, err = resolveDomain(cmd.domain)
+        if not path or not addr or math.type(length) ~= "integer" or length <= 0 then
             response.data = { error = "memory.dump_to_file requires {address, length, path}" }
             return response
         end
-        local prev = memory.getcurrentmemorydomain()
-        setMemoryDomain(domain)
+        if not domain then
+            response.data = { error = err }
+            return response
+        end
         local f = io.open(path, "wb")
         if not f then
-            setMemoryDomain(prev)
             response.data = { error = "cannot open " .. tostring(path) }
             return response
         end
-        for i = 0, length - 1 do
-            f:write(string.char(memory.readbyte(addr + i)))
-        end
+        f:write(readBlock(addr, length, domain))
         f:close()
-        setMemoryDomain(prev)
         response.data = { saved = true, path = path, bytes = length,
                           address = string.format("0x%08X", addr) }
 
@@ -1461,14 +1646,17 @@ local function processCommand(cmd)
         setMemoryDomain(DEFAULT_SYSTEM_DOMAIN)
         local v = memory.read_u16_le(0x04000304)
         setMemoryDomain(prev)
-        local swap = (v >= 0x8000)
+        -- Bit 15 "Display Swap": 0 = engine A to the lower screen, 1 = upper
+        -- (GBATEK; libnds lcdMainOnTop() sets it).
+        local swap = (v & 0x8000) ~= 0
         response.data = {
             powcnt1 = v,
             hex = string.format("0x%04X", v),
             lcd_swap = swap,
-            engine_a_screen = swap and "bottom" or "top",
-            engine_b_screen = swap and "top" or "bottom",
-            engine_a_enabled = (v % 4) >= 2,
+            engine_a_screen = swap and "top" or "bottom",
+            engine_b_screen = swap and "bottom" or "top",
+            engine_a_enabled = (v & 0x0002) ~= 0,
+            engine_b_enabled = (v & 0x0200) ~= 0,
         }
 
     elseif action == "dispcnt.decode" then
@@ -1488,7 +1676,7 @@ local function processCommand(cmd)
             hex = string.format("0x%08X", dc),
             mode = dc % 8,
             obj_1d_mapping = ((math.floor(dc / 16) % 2) == 1),
-            obj_boundary = (math.floor(dc / 2^20) % 8),
+            obj_boundary = (math.floor(dc / 2^20) % 4),  -- bits 20-21
             obj_enabled = ((math.floor(dc / 4096) % 2) == 1),
             bg0_enabled = bg_on[0], bg1_enabled = bg_on[1],
             bg2_enabled = bg_on[2], bg3_enabled = bg_on[3],
@@ -1500,7 +1688,9 @@ local function processCommand(cmd)
         setMemoryDomain(DEFAULT_SYSTEM_DOMAIN)
         local banks = {}
         for i = 0, 8 do
-            local v = memory.readbyte(0x04000240 + i)
+            -- VRAMCNT_A..G are 0x240..0x246; 0x247 is WRAMCNT, so H/I
+            -- sit one byte later at 0x248/0x249.
+            local v = memory.readbyte(0x04000240 + i + (i >= 7 and 1 or 0))
             banks[string.char(65 + i)] = {
                 value = v, hex = string.format("0x%02X", v),
                 enable = (v >= 0x80),
@@ -1524,6 +1714,13 @@ local function processCommand(cmd)
         local char_base = math.floor(cnt / 4) % 16
         local map_addr = vram_base + screen_base * 0x800
         local tile_addr = vram_base + char_base * 0x4000
+        if engine ~= "sub" then
+            -- Engine A adds DISPCNT's 64 KB screen base (bits 27-29) and
+            -- char base (bits 24-26); engine B has no such fields.
+            local dc = memory.read_u32_le(0x04000000)
+            map_addr = map_addr + ((dc >> 27) & 7) * 0x10000
+            tile_addr = tile_addr + ((dc >> 24) & 7) * 0x10000
+        end
         local rows = {}
         for r = 0, 23 do
             local row = {}
@@ -1607,7 +1804,19 @@ local function processCommand(cmd)
         response.success = false
         response.error = "Unknown action: " .. tostring(action)
     end
-    
+
+    return response
+end
+
+-- Handlers report failures as { error = ... } in data; lift those so the
+-- response says success=false instead of "succeeding" with an error payload.
+local function processCommand(cmd)
+    local response = dispatchCommand(cmd)
+    local data = response.data
+    if response.success and type(data) == "table" and data.error ~= nil then
+        response.success = false
+        response.error = tostring(data.error)
+    end
     return response
 end
 
@@ -1637,7 +1846,8 @@ local function updateState()
     local state = {
         -- State
         state = currentState,
-        isPaused = isPausedState,
+        -- also true when paused from the EmuHawk GUI
+        isPaused = isPausedState or safe(client.ispaused, false),
         romLoaded = loaded,
         -- Game info (only read core-dependent values when a ROM is loaded)
         frameCount = loaded and safe(emu.framecount, 0) or 0,
@@ -1808,8 +2018,8 @@ console.log("")
 
 -- List memory domains for reference (only meaningful with a core loaded)
 do
-    local ok, domains = pcall(memory.getmemorydomainlist)
-    if ok and domains then
+    local ok, domains = pcall(Memory.getDomains)
+    if ok and domains and #domains > 0 then
         console.log("Available Memory Domains:")
         for i, domain in ipairs(domains) do
             console.log("  " .. i .. ". " .. domain)
@@ -1837,10 +2047,6 @@ while true do
     -- always writes a fresh timestamp, even with no ROM loaded.
     if frameCounter % 10 == 0 then
         pcall(updateState)
-    end
-
-    if traceEnabled then
-        pcall(Trace.logInstruction)
     end
 
     -- Apply frozen values (maintain cheats); no-op when none are set.
